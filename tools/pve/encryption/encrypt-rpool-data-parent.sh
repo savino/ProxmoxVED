@@ -62,18 +62,39 @@ need_cmd() {
 
 PASS_FILE="${1:-}"
 AUTO_YES=0
-if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+DRY_RUN=0
+RESTART_AFTER=0
+
+if [ "$#" -lt 1 ]; then
   cat >&2 <<'EOF'
 Usage:
-  encrypt-rpool-data-parent.sh <PASS_FILE> [--yes]
+  encrypt-rpool-data-parent.sh <PASS_FILE> [--yes] [--dry-run] [--restart]
+
+Options:
+  --yes      Non-interactive: accept prompts
+  --dry-run  Show recap and affected guests without making changes
+  --restart  Start stopped guests after successful migration
 EOF
   exit 1
 fi
 
-if [ "$#" -eq 2 ]; then
-  [ "$2" = "--yes" ] || die "unexpected argument: $2"
-  AUTO_YES=1
-fi
+PASS_FILE="$1"
+shift || true
+for a in "$@"; do
+  case "$a" in
+    --yes) AUTO_YES=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    --restart) RESTART_AFTER=1 ;;
+    -h|--help)
+      cat >&2 <<'EOF'
+Usage:
+  encrypt-rpool-data-parent.sh <PASS_FILE> [--yes] [--dry-run] [--restart]
+EOF
+      exit 0
+      ;;
+    *) die "unexpected argument: $a" ;;
+  esac
+done
 
 SOURCE_STORAGE="local-zfs"
 SOURCE_PARENT="rpool/data"
@@ -354,6 +375,28 @@ stop_vm_if_needed() {
   STOPPED_VMS+=("$vmid")
 }
 
+start_ct_if_needed() {
+  local ctid="$1"
+  msg_info "starting CT ${ctid}"
+  pct start "$ctid" || die "failed to start CT ${ctid}"
+  if wait_for_ct_state "$ctid" running 120; then
+    msg_ok "CT ${ctid} started"
+  else
+    die "CT ${ctid} failed to reach running state"
+  fi
+}
+
+start_vm_if_needed() {
+  local vmid="$1"
+  msg_info "starting VM ${vmid}"
+  qm start "$vmid" || die "failed to start VM ${vmid}"
+  if wait_for_vm_state "$vmid" running 120; then
+    msg_ok "VM ${vmid} started"
+  else
+    die "VM ${vmid} failed to reach running state"
+  fi
+}
+
 check_space() {
   local used_bytes=""
   local available_bytes=""
@@ -463,6 +506,11 @@ migrate_children() {
   for source_child in "${SOURCE_CHILDREN[@]}"; do
     dest_child="${DEST_PARENT}/${source_child##*/}"
     msg_info "migrating ${source_child} to ${dest_child}"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      printf 'DRY-RUN: would run: zfs send -R "%s@%s" | zfs recv -u -F "%s"\n' "$source_child" "$SNAP_NAME" "$dest_child"
+      RECVD_DATASETS+=("$dest_child")
+      continue
+    fi
     zfs send -R "${source_child}@${SNAP_NAME}" | zfs recv -u -F "$dest_child"
     RECVD_DATASETS+=("$dest_child")
     msg_ok "migrated ${source_child}"
@@ -475,8 +523,12 @@ switch_storage() {
   msg_ok "storage config backed up"
 
   msg_info "switching ${SOURCE_STORAGE} pool to ${DEST_PARENT}"
-  pvesm set "$SOURCE_STORAGE" --pool "$DEST_PARENT"
-  msg_ok "storage ${SOURCE_STORAGE} now points to ${DEST_PARENT}"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'DRY-RUN: would run: pvesm set %s --pool %s\n' "$SOURCE_STORAGE" "$DEST_PARENT"
+  else
+    pvesm set "$SOURCE_STORAGE" --pool "$DEST_PARENT"
+    msg_ok "storage ${SOURCE_STORAGE} now points to ${DEST_PARENT}"
+  fi
 }
 
 print_summary() {
@@ -503,6 +555,11 @@ collect_source_children
 collect_affected_cts
 collect_affected_vms
 print_recap
+if [ "$DRY_RUN" -eq 1 ]; then
+  msg_ok "dry-run mode: no changes made; exiting after recap"
+  exit 0
+fi
+
 confirm_execution
 
 for vmid in "${AFFECTED_VMS[@]}"; do
@@ -518,3 +575,13 @@ switch_storage
 
 trap - EXIT
 print_summary
+if [ "$DRY_RUN" -eq 0 ] && [ "$RESTART_AFTER" -eq 1 ]; then
+  msg_info "restarting previously stopped guests"
+  for vmid in "${STOPPED_VMS[@]}"; do
+    start_vm_if_needed "$vmid"
+  done
+  for ctid in "${STOPPED_CTS[@]}"; do
+    start_ct_if_needed "$ctid"
+  done
+  msg_ok "restarted guests"
+fi
