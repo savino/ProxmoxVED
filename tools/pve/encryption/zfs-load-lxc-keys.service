@@ -1,0 +1,20 @@
+[Unit]
+Description=Load ZFS keys for encrypted LXC datasets (template)
+DefaultDependencies=no
+After=zfs-import.target
+Before=zfs-mount.service
+Wants=zfs-import.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/zfs-load-lxc-keys.sh
+TimeoutStartSec=60
+
+[Install]
+WantedBy=zfs.target
+
+# Installation notes:
+# - Copy this file to /etc/systemd/system/zfs-load-lxc-keys.service
+# - Ensure the script /usr/local/sbin/zfs-load-lxc-keys.sh is installed and
+#   executable (chmod 700).
+# - Then run: systemctl daemon-reload && systemctl enable --now zfs-load-lxc-keys.service
