@@ -60,41 +60,53 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
 }
 
-PASS_FILE="${1:-}"
-AUTO_YES=0
-DRY_RUN=0
-RESTART_AFTER=0
+ AUTO_YES=0
+ DRY_RUN=0
+ RESTART_AFTER=0
+ SWITCH_ONLY=0
+ RESTORE=0
+ PASS_FILE=""
 
-if [ "$#" -lt 1 ]; then
+ usage() {
   cat >&2 <<'EOF'
 Usage:
-  encrypt-rpool-data-parent.sh <PASS_FILE> [--yes] [--dry-run] [--restart]
+  encrypt-rpool-data-parent.sh <PASS_FILE> [--yes] [--dry-run] [--restart] [--switch-only]
+  encrypt-rpool-data-parent.sh --restore [--yes]
 
 Options:
-  --yes      Non-interactive: accept prompts
-  --dry-run  Show recap and affected guests without making changes
-  --restart  Start stopped guests after successful migration
+  --yes          Non-interactive: accept prompts
+  --dry-run      Show recap and affected guests without making changes
+  --restart      Start stopped guests after successful migration
+  --switch-only  Skip ZFS migration, only patch storage.cfg and reload pvestatd (recovery mode)
+  --restore      Restore previous storage.cfg and remount original datasets (use when switch failed)
 EOF
-  exit 1
-fi
+}
 
-PASS_FILE="$1"
-shift || true
-for a in "$@"; do
-  case "$a" in
-    --yes) AUTO_YES=1 ;;
-    --dry-run) DRY_RUN=1 ;;
-    --restart) RESTART_AFTER=1 ;;
-    -h|--help)
-      cat >&2 <<'EOF'
-Usage:
-  encrypt-rpool-data-parent.sh <PASS_FILE> [--yes] [--dry-run] [--restart]
-EOF
-      exit 0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --yes) AUTO_YES=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --restart) RESTART_AFTER=1; shift ;;
+    --switch-only) SWITCH_ONLY=1; shift ;;
+    --restore) RESTORE=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --*) die "unexpected argument: $1" ;;
+    *)
+      if [ -z "$PASS_FILE" ]; then
+        PASS_FILE="$1"
+        shift
+      else
+        die "unexpected argument: $1"
+      fi
       ;;
-    *) die "unexpected argument: $a" ;;
   esac
 done
+
+# PASS_FILE is required for normal operation; --restore does not need it
+if [ "$RESTORE" -eq 0 ] && [ -z "$PASS_FILE" ]; then
+  usage
+  exit 1
+fi
 
 SOURCE_STORAGE="local-zfs"
 SOURCE_PARENT="rpool/data"
@@ -104,6 +116,7 @@ TS="$(date +%Y%m%d-%H%M%S)"
 SNAP_NAME="pre-parent-encrypt-${TS}"
 STORAGE_CFG="/etc/pve/storage.cfg"
 STORAGE_CFG_BAK="/root/storage.cfg.bak.${TS}"
+MOUNT_BAK="/root/orig-mounts.${TS}.txt"
 POOL_ROOT="${SOURCE_PARENT%%/*}"
 MIN_HEADROOM_BYTES=1073741824
 SHUTDOWN_TIMEOUT=180
@@ -574,6 +587,23 @@ migrate_children() {
   zfs set "${PROP_NS}:note=whole-parent-migration" "$DEST_PARENT"
   msg_ok "stored parent metadata"
 
+  # capture original mountpoints for children so we can restore them on the new datasets
+  msg_info "recording original mountpoints for child datasets"
+  declare -A ORIG_MOUNT=()
+  for source_child in "${SOURCE_CHILDREN[@]}"; do
+    ORIG_MOUNT["$source_child"]="$(zfs get -H -o value mountpoint "$source_child" 2>/dev/null || true)"
+  done
+  msg_ok "recorded mountpoints for ${#SOURCE_CHILDREN[@]} datasets"
+
+  # load key for the new encrypted parent so we can mount received children
+  msg_info "loading key for ${DEST_PARENT}"
+  if ! zfs load-key "$DEST_PARENT" >/dev/null 2>&1; then
+    msg_error "warning: failed to load key for ${DEST_PARENT}; children may not mount automatically"
+  else
+    keystatus="$(zfs get -H -o value keystatus "$DEST_PARENT" 2>/dev/null || echo "")"
+    msg_info "keystatus=${keystatus}"
+  fi
+
   msg_info "creating recursive snapshot ${SOURCE_PARENT}@${SNAP_NAME}"
   zfs snapshot -r "${SOURCE_PARENT}@${SNAP_NAME}"
   msg_ok "snapshot created"
@@ -593,6 +623,40 @@ migrate_children() {
     else
       zfs send -R "${source_child}@${SNAP_NAME}" | zfs recv -u -F "$dest_child"
     fi
+    # restore original mountpoint if present; first free the path on the source
+    local orig_mp="${ORIG_MOUNT["$source_child"]}"
+    local source_type
+    source_type="$(zfs get -H -o value type "$source_child" 2>/dev/null || echo "")"
+    local dest_type
+    dest_type="$(zfs get -H -o value type "$dest_child" 2>/dev/null || echo "")"
+
+    if [ -n "${orig_mp}" ] && [ "${orig_mp}" != "none" ] && [ "${source_type}" = "filesystem" ]; then
+      msg_info "unmounting original ${source_child} (mounted=$(zfs get -H -o value mounted "$source_child" 2>/dev/null || echo unknown))"
+      local mounted_val
+      mounted_val="$(zfs get -H -o value mounted "$source_child" 2>/dev/null || echo "no")"
+      if [ "${mounted_val}" = "yes" ]; then
+        zfs unmount "$source_child" >/dev/null 2>&1 || msg_error "failed to unmount ${source_child}"
+      fi
+      # clear the original mountpoint so the path is free; keep orig_mp in memory/property
+      zfs set mountpoint=none "$source_child" >/dev/null 2>&1 || msg_error "failed to clear mountpoint for ${source_child}"
+      msg_ok "unmounted and cleared mountpoint for ${source_child}"
+    fi
+
+    if [ -n "${orig_mp}" ] && [ "${orig_mp}" != "none" ] && [ "${dest_type}" = "filesystem" ]; then
+      msg_info "recording original mountpoint on ${dest_child} and applying it"
+      # persist original mountpoint as a custom property for later recovery
+      zfs set "${PROP_NS}:orig-mount=${orig_mp}" "$dest_child" >/dev/null 2>&1 || msg_error "failed to record original mountpoint on ${dest_child}"
+      zfs set mountpoint="${orig_mp}" "$dest_child" || msg_error "failed to set mountpoint for ${dest_child}"
+      # attempt to mount (requires key to be loaded)
+      if zfs mount "$dest_child" >/dev/null 2>&1; then
+        msg_ok "mounted ${dest_child}"
+      else
+        msg_info "could not mount ${dest_child} now; will require manual mount or key load"
+      fi
+    else
+      msg_info "no original mountpoint for ${source_child} or dest not a filesystem; leaving ${dest_child} with inherited mountpoint"
+    fi
+
     RECVD_DATASETS+=("$dest_child")
     msg_ok "migrated ${source_child}"
   done
@@ -603,9 +667,140 @@ switch_storage() {
   cp -a "$STORAGE_CFG" "$STORAGE_CFG_BAK"
   msg_ok "storage config backed up"
 
-  msg_info "switching ${SOURCE_STORAGE} pool to ${DEST_PARENT}"
-  pvesm set "$SOURCE_STORAGE" --pool "$DEST_PARENT"
+  # pvesm set cannot change 'pool' (it is a fixed parameter in Proxmox).
+  # Edit storage.cfg directly: replace the pool line inside the storage block.
+  msg_info "patching ${STORAGE_CFG}: setting pool to ${DEST_PARENT} for ${SOURCE_STORAGE}"
+  local in_block=0
+  local patched=0
+  local tmp=""
+  tmp="$(mktemp)"
+  while IFS= read -r line; do
+    if printf '%s\n' "$line" | grep -qE "^zfspool:[[:space:]]*${SOURCE_STORAGE}[[:space:]]*$"; then
+      in_block=1
+    elif printf '%s\n' "$line" | grep -qE "^[a-zA-Z]"; then
+      in_block=0
+    fi
+    if [ "$in_block" -eq 1 ] && printf '%s\n' "$line" | grep -qE "^[[:space:]]+pool[[:space:]]"; then
+      printf '\tpool %s\n' "$DEST_PARENT" >>"$tmp"
+      patched=1
+    else
+      printf '%s\n' "$line" >>"$tmp"
+    fi
+  done <"$STORAGE_CFG"
+
+  if [ "$patched" -eq 0 ]; then
+    rm -f "$tmp"
+    die "could not find 'pool' line for storage '${SOURCE_STORAGE}' in ${STORAGE_CFG}"
+  fi
+
+  cp -a "$tmp" "$STORAGE_CFG"
+  rm -f "$tmp"
+  msg_ok "storage.cfg patched: ${SOURCE_STORAGE} pool → ${DEST_PARENT}"
+
+  msg_info "reloading pvestatd to pick up new storage config"
+  systemctl reload-or-restart pvestatd 2>/dev/null || true
+  msg_ok "pvestatd reloaded"
+
+  # Verify the change was applied
+  local actual_pool=""
+  actual_pool="$(get_storage_pool "$SOURCE_STORAGE")"
+  [ "$actual_pool" = "$DEST_PARENT" ] || \
+    die "storage pool was not updated correctly: expected '${DEST_PARENT}', found '${actual_pool}'"
   msg_ok "storage ${SOURCE_STORAGE} now points to ${DEST_PARENT}"
+}
+
+# Prepare for switch-only: record original mountpoints and unmount originals
+prepare_switch_unmount_sources() {
+  msg_info "recording and unmounting original source datasets"
+  : >"$MOUNT_BAK" || die "cannot write mount backup: $MOUNT_BAK"
+  local src=""
+  for src in "${SOURCE_CHILDREN[@]}"; do
+    local mp
+    mp="$(zfs get -H -o value mountpoint "$src" 2>/dev/null || echo "")"
+    printf '%s %s\n' "$src" "${mp:-none}" >>"$MOUNT_BAK"
+    if [ -n "${mp}" ] && [ "${mp}" != "none" ]; then
+      local mounted
+      mounted="$(zfs get -H -o value mounted "$src" 2>/dev/null || echo "no")"
+      if [ "$mounted" = "yes" ]; then
+        msg_info "unmounting ${src}"
+        zfs unmount "$src" || die "failed to unmount ${src}"
+      fi
+      msg_info "clearing mountpoint for ${src}"
+      zfs set mountpoint=none "$src" || die "failed to clear mountpoint for ${src}"
+      msg_ok "unmounted and cleared mountpoint for ${src}"
+    else
+      msg_info "no mountpoint set for ${src}; skipping"
+    fi
+  done
+  msg_ok "original mountpoints recorded to ${MOUNT_BAK}"
+}
+
+# Restore previous state: restore storage.cfg, unmount dest children and remount originals
+restore_state() {
+  msg_info "locating storage.cfg backup to restore"
+  local stor_bak
+  stor_bak=""
+  local f
+  for f in /root/storage.cfg.bak.*; do
+    [ -e "$f" ] || continue
+    if [ -z "$stor_bak" ] || [ "$f" -nt "$stor_bak" ]; then
+      stor_bak="$f"
+    fi
+  done
+  [ -n "$stor_bak" ] || die "no storage.cfg backup found in /root"
+  msg_info "restoring storage.cfg from ${stor_bak}"
+  cp -a "$stor_bak" "$STORAGE_CFG" || die "failed to restore ${STORAGE_CFG}"
+  msg_ok "restored ${STORAGE_CFG}"
+
+  msg_info "reloading pvestatd"
+  systemctl reload-or-restart pvestatd 2>/dev/null || true
+  msg_ok "pvestatd reloaded"
+
+  msg_info "unmounting new encrypted datasets under ${DEST_PARENT} (if any)"
+  if zfs list -H "$DEST_PARENT" >/dev/null 2>&1; then
+    local d=""
+    while IFS= read -r d; do
+      [ -n "$d" ] || continue
+      if [ "$d" = "$DEST_PARENT" ]; then continue; fi
+      local m
+      m="$(zfs get -H -o value mounted "$d" 2>/dev/null || echo "no")"
+      if [ "$m" = "yes" ]; then
+        zfs unmount "$d" >/dev/null 2>&1 || msg_error "failed to unmount ${d}"
+      fi
+      zfs set mountpoint=none "$d" >/dev/null 2>&1 || true
+    done < <(zfs list -H -r -d 1 -o name "$DEST_PARENT")
+  fi
+  msg_ok "unmounted new datasets"
+
+  msg_info "restoring original mountpoints from backup"
+  local mb
+  mb=""
+  for f in /root/orig-mounts.*; do
+    [ -e "$f" ] || continue
+    if [ -z "$mb" ] || [ "$f" -nt "$mb" ]; then
+      mb="$f"
+    fi
+  done
+  [ -n "$mb" ] || die "no mount backup found in /root"
+  local line dataset orig
+  while IFS= read -r line || [ -n "$line" ]; do
+    dataset="$(awk '{print $1}' <<<"$line")"
+    orig="$(awk '{print $2}' <<<"$line")"
+    [ -n "$dataset" ] || continue
+    if ! zfs list -H "$dataset" >/dev/null 2>&1; then
+      msg_error "original dataset missing: ${dataset}"
+      continue
+    fi
+    if [ -n "$orig" ] && [ "$orig" != "none" ]; then
+      zfs set mountpoint="$orig" "$dataset" || msg_error "failed to set mountpoint for ${dataset}"
+      if zfs mount "$dataset" >/dev/null 2>&1; then
+        msg_ok "mounted ${dataset} at ${orig}"
+      else
+        msg_error "failed to mount ${dataset} at ${orig}"
+      fi
+    fi
+  done < "$mb"
+  msg_ok "original mountpoints restored (where possible)"
 }
 
 print_summary() {
@@ -627,8 +822,31 @@ print_summary() {
   printf '  pvesm set %s --pool %s\n' "$SOURCE_STORAGE" "$SOURCE_PARENT"
 }
 
+
+if [ "$RESTORE" -eq 1 ]; then
+  set_step "restore state"
+  restore_state
+  trap - EXIT
+  print_summary
+  exit 0
+fi
+
 set_step "validate environment"
 validate_environment
+
+if [ "$SWITCH_ONLY" -eq 1 ]; then
+  msg_info "--switch-only: skipping ZFS migration, patching storage.cfg only"
+  confirm_execution
+  set_step "collect child datasets"
+  collect_source_children
+  set_step "prepare for switch: unmount originals"
+  prepare_switch_unmount_sources
+  set_step "switch storage"
+  switch_storage
+  trap - EXIT
+  print_summary
+  exit 0
+fi
 
 set_step "collect child datasets"
 collect_source_children
