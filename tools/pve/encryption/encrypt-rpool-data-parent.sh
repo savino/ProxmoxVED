@@ -486,6 +486,13 @@ validate_environment() {
   need_cmd zfs
   msg_ok "all required commands found"
 
+  set_step "check pv"
+  if command -v pv >/dev/null 2>&1; then
+    msg_ok "pv available — transfer progress will be displayed"
+  else
+    msg_info "pv not found — transfer will run without live progress (install with: apt install pv)"
+  fi
+
   set_step "validate passphrase file"
   msg_info "validating passphrase file: ${PASS_FILE}"
   [ -f "$PASS_FILE" ] || die "passphrase file not found: $PASS_FILE"
@@ -573,8 +580,19 @@ migrate_children() {
 
   for source_child in "${SOURCE_CHILDREN[@]}"; do
     dest_child="${DEST_PARENT}/${source_child##*/}"
-    msg_info "migrating ${source_child} to ${dest_child}"
-    zfs send -R "${source_child}@${SNAP_NAME}" | zfs recv -u -F "$dest_child"
+    local child_used=""
+    child_used="$(zfs get -Hp -o value used "$source_child" 2>/dev/null || echo 0)"
+    printf '\n'
+    msg_info "migrating ${source_child} → ${dest_child}  (estimated size: $(numfmt --to=iec-i --suffix=B "$child_used" 2>/dev/null || printf '%s bytes' "$child_used"))"
+    if command -v pv >/dev/null 2>&1; then
+      zfs send -R "${source_child}@${SNAP_NAME}" \
+        | pv -s "$child_used" \
+             -F '%t elapsed  %b transferred  %r  ETA %e  [%B]' \
+             --interval 1 \
+        | zfs recv -u -F "$dest_child"
+    else
+      zfs send -R "${source_child}@${SNAP_NAME}" | zfs recv -u -F "$dest_child"
+    fi
     RECVD_DATASETS+=("$dest_child")
     msg_ok "migrated ${source_child}"
   done
