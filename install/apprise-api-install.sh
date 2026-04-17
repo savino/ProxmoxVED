@@ -2,7 +2,7 @@
 
 # Copyright (c) 2021-2026 community-scripts ORG
 # Author: SystemIdleProcess
-# License: MIT | https://github.com/community-scripts/ProxmoxVED/raw/main/LICENSE
+# License: MIT | https://github.com/savino/ProxmoxVED/raw/main/LICENSE
 # Source: https://github.com/caronc/apprise-api
 
 source /dev/stdin <<<"$FUNCTIONS_FILE_PATH"

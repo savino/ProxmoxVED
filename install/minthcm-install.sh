@@ -2,7 +2,7 @@
 
 # Copyright (c) 2021-2025 minthcm
 # Author: MintHCM
-# License: MIT | https://github.com/community-scripts/ProxmoxVED/raw/main/LICENSE
+# License: MIT | https://github.com/savino/ProxmoxVED/raw/main/LICENSE
 # Source: https://github.com/minthcm/minthcm
 source /dev/stdin <<<"$FUNCTIONS_FILE_PATH"
 

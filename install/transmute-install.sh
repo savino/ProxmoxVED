@@ -2,7 +2,7 @@
 
 # Copyright (c) 2021-2026 community-scripts ORG
 # Author: MickLesk
-# License: MIT | https://github.com/community-scripts/ProxmoxVED/raw/main/LICENSE
+# License: MIT | https://github.com/savino/ProxmoxVED/raw/main/LICENSE
 # Source: https://github.com/transmute-app/transmute
 
 source /dev/stdin <<<"$FUNCTIONS_FILE_PATH"

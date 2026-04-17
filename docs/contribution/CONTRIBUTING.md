@@ -36,8 +36,8 @@ Before contributing, set up:
 
 Use these templates as your starting point:
 
-- [CT template: `AppName.sh`](https://github.com/community-scripts/ProxmoxVED/blob/main/.github/CONTRIBUTOR_AND_GUIDES/ct/AppName.sh)
-- [Install template: `AppName-install.sh`](https://github.com/community-scripts/ProxmoxVED/blob/main/.github/CONTRIBUTOR_AND_GUIDES/install/AppName-install.sh)
+- [CT template: `AppName.sh`](https://github.com/savino/ProxmoxVED/blob/main/.github/CONTRIBUTOR_AND_GUIDES/ct/AppName.sh)
+- [Install template: `AppName-install.sh`](https://github.com/savino/ProxmoxVED/blob/main/.github/CONTRIBUTOR_AND_GUIDES/install/AppName-install.sh)
 
 ## Script types
 
@@ -45,7 +45,7 @@ Use these templates as your starting point:
 
 Reference guide:
 
-- [CT coding guide for `AppName.sh`](https://github.com/community-scripts/ProxmoxVED/blob/main/.github/CONTRIBUTOR_AND_GUIDES/ct/AppName.md)
+- [CT coding guide for `AppName.sh`](https://github.com/savino/ProxmoxVED/blob/main/.github/CONTRIBUTOR_AND_GUIDES/ct/AppName.md)
 
 This script is responsible for:
 
@@ -57,7 +57,7 @@ This script is responsible for:
 
 Reference guide:
 
-- [Install coding guide for `AppName-install.sh`](https://github.com/community-scripts/ProxmoxVED/blob/main/.github/CONTRIBUTOR_AND_GUIDES/install/AppName-install.md)
+- [Install coding guide for `AppName-install.sh`](https://github.com/savino/ProxmoxVED/blob/main/.github/CONTRIBUTOR_AND_GUIDES/install/AppName-install.md)
 
 This script is responsible for:
 
@@ -131,7 +131,7 @@ Add a Json file with all Metadata for the App. [DOCS](https://community-scripts.
 
 ## Pages
 
-- [CT Template: AppName.sh](https://github.com/community-scripts/ProxmoxVED/blob/main/.github/CONTRIBUTOR_AND_GUIDES/ct/AppName.sh)
-- [Install Template: AppName-install.sh](https://github.com/community-scripts/ProxmoxVED/blob/main/.github/CONTRIBUTOR_AND_GUIDES/install/AppName-install.sh)
+- [CT Template: AppName.sh](https://github.com/savino/ProxmoxVED/blob/main/.github/CONTRIBUTOR_AND_GUIDES/ct/AppName.sh)
+- [Install Template: AppName-install.sh](https://github.com/savino/ProxmoxVED/blob/main/.github/CONTRIBUTOR_AND_GUIDES/install/AppName-install.sh)
 - [Fork setup guide](./FORK_SETUP.md)
 - [Contribution README](./README.md)

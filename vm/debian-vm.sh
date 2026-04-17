@@ -2,7 +2,7 @@
 
 # Copyright (c) 2021-2026 community-scripts ORG
 # Author: MickLesk (CanbiZ)
-# License: MIT | https://github.com/community-scripts/ProxmoxVED/raw/main/LICENSE
+# License: MIT | https://github.com/savino/ProxmoxVED/raw/main/LICENSE
 
 COMMUNITY_SCRIPTS_URL="${COMMUNITY_SCRIPTS_URL:-https://git.community-scripts.org/community-scripts/ProxmoxVED/raw/branch/main}"
 source /dev/stdin <<<$(curl -fsSL "$COMMUNITY_SCRIPTS_URL/misc/api.func")
@@ -378,4 +378,4 @@ if [ "$START_VM" == "yes" ]; then
 fi
 
 msg_ok "Completed successfully!\n"
-msg_custom "More Info at https://github.com/community-scripts/ProxmoxVED/discussions/836"
+msg_custom "More Info at https://github.com/savino/ProxmoxVED/discussions/836"
