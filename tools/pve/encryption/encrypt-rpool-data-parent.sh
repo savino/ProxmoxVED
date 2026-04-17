@@ -117,12 +117,21 @@ declare -a STOPPED_CTS=()
 declare -a STOPPED_VMS=()
 declare -a RECVD_DATASETS=()
 
+CURRENT_STEP="(init)"
+set_step() { CURRENT_STEP="$*"; }
+
 cleanup_on_error() {
   local ec=$?
   if [ "$ec" -ne 0 ]; then
     printf '\n' >&2
-    msg_error "migration aborted with exit code $ec" >&2
-    printf 'Rollback hints:\n' >&2
+    msg_error "aborted at step [${CURRENT_STEP}] with exit code ${ec}" >&2
+    printf '\nDebug info:\n' >&2
+    printf '  PASS_FILE:       %s\n' "${PASS_FILE:-<unset>}" >&2
+    printf '  SOURCE_STORAGE:  %s\n' "${SOURCE_STORAGE:-<unset>}" >&2
+    printf '  SOURCE_PARENT:   %s\n' "${SOURCE_PARENT:-<unset>}" >&2
+    printf '  DEST_PARENT:     %s\n' "${DEST_PARENT:-<unset>}" >&2
+    printf '  DRY_RUN:         %s\n' "${DRY_RUN:-0}" >&2
+    printf '\nRollback hints:\n' >&2
     printf '  storage config backup: %s\n' "$STORAGE_CFG_BAK" >&2
     printf '  snapshot: %s@%s\n' "$SOURCE_PARENT" "$SNAP_NAME" >&2
     if [ "${#RECVD_DATASETS[@]}" -gt 0 ]; then
@@ -164,7 +173,10 @@ get_storage_type() {
 
 get_storage_pool() {
   local storage="$1"
-  pvesm config "$storage" 2>/dev/null | awk '$1=="pool" {print $2; exit}'
+  awk -v s="$storage" '
+    /^[a-zA-Z]/ { in_sec = ($0 ~ "^[^ 	:]+:[ 	]*" s "[ 	]*$") }
+    in_sec && $1 == "pool" { print $2; exit }
+  ' "$STORAGE_CFG"
 }
 
 resolve_volid_dataset() {
@@ -217,15 +229,22 @@ append_unique() {
 
 collect_source_children() {
   local child=""
+  set_step "collect child datasets"
+  msg_info "listing child datasets under ${SOURCE_PARENT}"
   while IFS= read -r child; do
     [ -n "$child" ] || continue
     SOURCE_CHILDREN+=("$child")
   done < <(zfs list -H -r -d 1 -o name "$SOURCE_PARENT" | awk -v parent="$SOURCE_PARENT" '$1 != parent')
 
-  [ "${#SOURCE_CHILDREN[@]}" -gt 0 ] || die "no child datasets found under ${SOURCE_PARENT}"
+  if [ "${#SOURCE_CHILDREN[@]}" -eq 0 ]; then
+    die "no child datasets found under ${SOURCE_PARENT} — is the storage pool correct?"
+  fi
+  msg_ok "found ${#SOURCE_CHILDREN[@]} child dataset(s) under ${SOURCE_PARENT}"
 }
 
 collect_affected_cts() {
+  set_step "collect affected CTs"
+  msg_info "scanning CT configs for disks under ${SOURCE_PARENT}"
   local conf=""
   local ctid=""
   local key=""
@@ -259,9 +278,12 @@ collect_affected_cts() {
       print key "|" $0
     }' "$conf")
   done
+  msg_ok "found ${#AFFECTED_CTS[@]} affected CT(s)"
 }
 
 collect_affected_vms() {
+  set_step "collect affected VMs"
+  msg_info "scanning VM configs for disks under ${SOURCE_PARENT}"
   local conf=""
   local vmid=""
   local key=""
@@ -295,6 +317,7 @@ collect_affected_vms() {
       print key "|" $0
     }' "$conf")
   done
+  msg_ok "found ${#AFFECTED_VMS[@]} affected VM(s)"
 }
 
 wait_for_ct_state() {
@@ -400,13 +423,16 @@ start_vm_if_needed() {
 check_space() {
   local used_bytes=""
   local available_bytes=""
+  msg_info "reading space usage for ${SOURCE_PARENT}"
   used_bytes="$(zfs get -Hp -o value used "$SOURCE_PARENT")"
   available_bytes="$(zfs get -Hp -o value available "$POOL_ROOT")"
   [ "$used_bytes" -gt 0 ] || die "unable to determine used space for ${SOURCE_PARENT}"
   [ "$available_bytes" -gt 0 ] || die "unable to determine available space for ${POOL_ROOT}"
-  if [ "$available_bytes" -lt $((used_bytes + MIN_HEADROOM_BYTES)) ]; then
-    die "insufficient free space in ${POOL_ROOT}: need at least $((used_bytes + MIN_HEADROOM_BYTES)) bytes, found ${available_bytes}"
+  msg_info "used=${used_bytes} bytes  available=${available_bytes} bytes  required=$(( used_bytes + MIN_HEADROOM_BYTES )) bytes"
+  if [ "$available_bytes" -lt $(( used_bytes + MIN_HEADROOM_BYTES )) ]; then
+    die "insufficient free space in ${POOL_ROOT}: need $((used_bytes + MIN_HEADROOM_BYTES)) bytes, have ${available_bytes}"
   fi
+  msg_ok "space check passed"
 }
 
 print_recap() {
@@ -444,6 +470,10 @@ print_recap() {
 validate_environment() {
   local storage_type=""
   local storage_pool=""
+  local enc_val=""
+
+  set_step "check required commands"
+  msg_info "checking required commands"
   need_cmd awk
   need_cmd cp
   need_cmd date
@@ -454,21 +484,59 @@ validate_environment() {
   need_cmd sleep
   need_cmd stat
   need_cmd zfs
+  msg_ok "all required commands found"
 
+  set_step "validate passphrase file"
+  msg_info "validating passphrase file: ${PASS_FILE}"
   [ -f "$PASS_FILE" ] || die "passphrase file not found: $PASS_FILE"
   [ -s "$PASS_FILE" ] || die "passphrase file is empty: $PASS_FILE"
   chmod 600 "$PASS_FILE"
+  msg_ok "passphrase file OK"
 
+  set_step "validate storage config"
+  msg_info "checking storage config: ${STORAGE_CFG}"
   [ -f "$STORAGE_CFG" ] || die "missing storage config: $STORAGE_CFG"
+  msg_ok "storage config exists"
+
+  set_step "validate source dataset"
+  msg_info "checking source dataset: ${SOURCE_PARENT}"
   zfs list -H "$SOURCE_PARENT" >/dev/null 2>&1 || die "source dataset not found: $SOURCE_PARENT"
-  ! zfs list -H "$DEST_PARENT" >/dev/null 2>&1 || die "destination dataset already exists: $DEST_PARENT"
+  msg_ok "source dataset exists: ${SOURCE_PARENT}"
 
+  if [ "$DRY_RUN" -eq 0 ]; then
+    set_step "validate dest dataset absent"
+    msg_info "checking destination does not already exist: ${DEST_PARENT}"
+    ! zfs list -H "$DEST_PARENT" >/dev/null 2>&1 || die "destination dataset already exists: $DEST_PARENT"
+    msg_ok "destination dataset absent: ${DEST_PARENT}"
+  fi
+
+  set_step "validate storage type"
+  msg_info "checking storage type for ${SOURCE_STORAGE}"
   storage_type="$(get_storage_type "$SOURCE_STORAGE")"
-  [ "$storage_type" = "zfspool" ] || die "${SOURCE_STORAGE} is not a zfspool storage"
-  storage_pool="$(get_storage_pool "$SOURCE_STORAGE")"
-  [ "$storage_pool" = "$SOURCE_PARENT" ] || die "${SOURCE_STORAGE} pool is ${storage_pool}, expected ${SOURCE_PARENT}"
+  if [ -z "$storage_type" ]; then
+    die "storage '${SOURCE_STORAGE}' not found in pvesm status"
+  fi
+  [ "$storage_type" = "zfspool" ] || die "${SOURCE_STORAGE} is type '${storage_type}', expected 'zfspool'"
+  msg_ok "storage type OK: ${storage_type}"
 
-  [ "$(zfs get -H -o value encryption "$SOURCE_PARENT")" = "off" ] || die "${SOURCE_PARENT} is already encrypted"
+  set_step "validate storage pool"
+  msg_info "checking pool for ${SOURCE_STORAGE}"
+  storage_pool="$(get_storage_pool "$SOURCE_STORAGE")"
+  msg_info "pool value read from storage.cfg: '${storage_pool}'"
+  if [ -z "$storage_pool" ]; then
+    die "could not determine pool for storage '${SOURCE_STORAGE}' in ${STORAGE_CFG} — check that 'pool' is set under '${SOURCE_STORAGE}'"
+  fi
+  [ "$storage_pool" = "$SOURCE_PARENT" ] || die "${SOURCE_STORAGE} pool is '${storage_pool}', expected '${SOURCE_PARENT}'"
+  msg_ok "storage pool OK: ${storage_pool}"
+
+  set_step "validate source encryption status"
+  msg_info "checking encryption on ${SOURCE_PARENT}"
+  enc_val="$(zfs get -H -o value encryption "$SOURCE_PARENT")"
+  msg_info "encryption property = ${enc_val}"
+  [ "$enc_val" = "off" ] || die "${SOURCE_PARENT} is already encrypted (encryption=${enc_val})"
+  msg_ok "source dataset is unencrypted — can proceed"
+
+  set_step "check available space"
   check_space
 }
 
@@ -506,11 +574,6 @@ migrate_children() {
   for source_child in "${SOURCE_CHILDREN[@]}"; do
     dest_child="${DEST_PARENT}/${source_child##*/}"
     msg_info "migrating ${source_child} to ${dest_child}"
-    if [ "$DRY_RUN" -eq 1 ]; then
-      printf 'DRY-RUN: would run: zfs send -R "%s@%s" | zfs recv -u -F "%s"\n' "$source_child" "$SNAP_NAME" "$dest_child"
-      RECVD_DATASETS+=("$dest_child")
-      continue
-    fi
     zfs send -R "${source_child}@${SNAP_NAME}" | zfs recv -u -F "$dest_child"
     RECVD_DATASETS+=("$dest_child")
     msg_ok "migrated ${source_child}"
@@ -523,12 +586,8 @@ switch_storage() {
   msg_ok "storage config backed up"
 
   msg_info "switching ${SOURCE_STORAGE} pool to ${DEST_PARENT}"
-  if [ "$DRY_RUN" -eq 1 ]; then
-    printf 'DRY-RUN: would run: pvesm set %s --pool %s\n' "$SOURCE_STORAGE" "$DEST_PARENT"
-  else
-    pvesm set "$SOURCE_STORAGE" --pool "$DEST_PARENT"
-    msg_ok "storage ${SOURCE_STORAGE} now points to ${DEST_PARENT}"
-  fi
+  pvesm set "$SOURCE_STORAGE" --pool "$DEST_PARENT"
+  msg_ok "storage ${SOURCE_STORAGE} now points to ${DEST_PARENT}"
 }
 
 print_summary() {
@@ -550,32 +609,49 @@ print_summary() {
   printf '  pvesm set %s --pool %s\n' "$SOURCE_STORAGE" "$SOURCE_PARENT"
 }
 
+set_step "validate environment"
 validate_environment
+
+set_step "collect child datasets"
 collect_source_children
+
+set_step "collect affected CTs"
 collect_affected_cts
+
+set_step "collect affected VMs"
 collect_affected_vms
+
 print_recap
-  if [ "$DRY_RUN" -eq 1 ]; then
-    msg_ok "dry-run mode: no changes made; exiting after recap"
-    exit 0
-  fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  trap - EXIT
+  printf '\n'
+  msg_ok "DRY-RUN complete — no changes were made"
+  exit 0
+fi
 
 confirm_execution
 
+set_step "stop affected VMs"
 for vmid in "${AFFECTED_VMS[@]}"; do
   stop_vm_if_needed "$vmid"
 done
 
+set_step "stop affected CTs"
 for ctid in "${AFFECTED_CTS[@]}"; do
   stop_ct_if_needed "$ctid"
 done
 
+set_step "migrate children"
 migrate_children
+
+set_step "switch storage"
 switch_storage
 
 trap - EXIT
 print_summary
-if [ "$DRY_RUN" -eq 0 ] && [ "$RESTART_AFTER" -eq 1 ]; then
+if [ "$RESTART_AFTER" -eq 1 ]; then
+  set_step "restart guests"
   msg_info "restarting previously stopped guests"
   for vmid in "${STOPPED_VMS[@]}"; do
     start_vm_if_needed "$vmid"
