@@ -555,10 +555,10 @@ collect_source_children
 collect_affected_cts
 collect_affected_vms
 print_recap
-if [ "$DRY_RUN" -eq 1 ]; then
-  msg_ok "dry-run mode: no changes made; exiting after recap"
-  exit 0
-fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    msg_ok "dry-run mode: no changes made; exiting after recap"
+    exit 0
+  fi
 
 confirm_execution
 
