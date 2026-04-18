@@ -1,8 +1,9 @@
 [Unit]
 Description=Load all ZFS encryption keys after USB key mount
 DefaultDependencies=no
-After=zfs-import.target mnt-_USB_PENDRIVE_KEY.mount
-Requires=zfs-import.target mnt-_USB_PENDRIVE_KEY.mount
+After=zfs-import.target local-fs.target
+Requires=zfs-import.target
+RequiresMountsFor=/mnt/_USB_PENDRIVE_KEY
 Before=zfs-mount.service
 ConditionPathIsMountPoint=/mnt/_USB_PENDRIVE_KEY
 
@@ -16,6 +17,7 @@ WantedBy=zfs.target
 
 # Installation notes:
 # - Ensure the USB device is mounted at /mnt/_USB_PENDRIVE_KEY before this service runs.
-# - If using /etc/fstab, verify that systemd generates mnt-_USB_PENDRIVE_KEY.mount.
+# - If using /etc/fstab, this unit uses RequiresMountsFor=/mnt/_USB_PENDRIVE_KEY
+#   and does not depend on a specific generated .mount unit name.
 # - Copy this file to /etc/systemd/system/zfs-load-all-keys-from-usb.service
 # - Then run: systemctl daemon-reload && systemctl enable --now zfs-load-all-keys-from-usb.service
