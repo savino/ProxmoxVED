@@ -122,6 +122,8 @@ MIN_HEADROOM_BYTES=1073741824
 SHUTDOWN_TIMEOUT=180
 GRACEFUL_WAIT_TIMEOUT=180
 FORCE_WAIT_TIMEOUT=60
+USB_KEY_MOUNT="/mnt/_USB_PENDRIVE_KEY"
+BOOT_UNLOCK_SERVICE="zfs-load-all-keys-from-usb.service"
 
 declare -a SOURCE_CHILDREN=()
 declare -a AFFECTED_CTS=()
@@ -129,6 +131,8 @@ declare -a AFFECTED_VMS=()
 declare -a STOPPED_CTS=()
 declare -a STOPPED_VMS=()
 declare -a RECVD_DATASETS=()
+declare -a RESTORE_AFFECTED_CTS=()
+declare -a RESTORE_AFFECTED_VMS=()
 
 CURRENT_STEP="(init)"
 set_step() { CURRENT_STEP="$*"; }
@@ -243,6 +247,61 @@ append_unique() {
   return 1
 }
 
+service_is_enabled() {
+  local unit="$1"
+  systemctl is-enabled "$unit" >/dev/null 2>&1
+}
+
+check_boot_unlock_prereqs() {
+  local pass_path="$1"
+  local pass_real=""
+  local zfs_load_service="zfs-load-key.service"
+
+  set_step "validate boot-time key loading strategy"
+  msg_info "checking boot-time key loading strategy"
+  pass_real="$(realpath "$pass_path" 2>/dev/null || printf '%s' "$pass_path")"
+
+  if [[ "$pass_real" == "${SOURCE_PARENT}"/* ]] || [[ "$pass_real" == "${DEST_PARENT}"/* ]] || [[ "$pass_real" == "/${DEST_PARENT}"/* ]]; then
+    die "passphrase file is inside managed datasets (${pass_real}); store it on rootfs or USB mount"
+  fi
+
+  if service_is_enabled "$BOOT_UNLOCK_SERVICE" || service_is_enabled "$zfs_load_service"; then
+    msg_ok "boot-time key loading service detected"
+    return 0
+  fi
+
+  if [[ "$pass_real" == "${USB_KEY_MOUNT}"/* ]]; then
+    die "passphrase is on ${USB_KEY_MOUNT} but ${BOOT_UNLOCK_SERVICE} is not enabled"
+  fi
+
+  die "no boot-time key loading service enabled (expected ${BOOT_UNLOCK_SERVICE} or ${zfs_load_service})"
+}
+
+validate_migrated_child() {
+  local child="$1"
+  local type=""
+  local enc=""
+  local encroot=""
+  local key_status=""
+
+  type="$(zfs get -H -o value type "$child" 2>/dev/null || echo "")"
+  enc="$(zfs get -H -o value encryption "$child" 2>/dev/null || echo "")"
+  encroot="$(zfs get -H -o value encryptionroot "$child" 2>/dev/null || echo "")"
+  key_status="$(zfs get -H -o value keystatus "$child" 2>/dev/null || echo "")"
+
+  [ "$enc" != "off" ] || die "destination ${child} is not encrypted (encryption=off)"
+  [ "$encroot" = "$DEST_PARENT" ] || die "destination ${child} has unexpected encryptionroot=${encroot}"
+  [ "$key_status" = "available" ] || die "destination ${child} key is unavailable (${key_status})"
+
+  if [ "$type" = "filesystem" ]; then
+    local mounted_val=""
+    mounted_val="$(zfs get -H -o value mounted "$child" 2>/dev/null || echo "no")"
+    if [ "$mounted_val" != "yes" ]; then
+      msg_info "filesystem ${child} is not mounted yet (this can be expected for non-active mountpoints)"
+    fi
+  fi
+}
+
 collect_source_children() {
   local child=""
   set_step "collect child datasets"
@@ -334,6 +393,88 @@ collect_affected_vms() {
     }' "$conf")
   done
   msg_ok "found ${#AFFECTED_VMS[@]} affected VM(s)"
+}
+
+collect_affected_cts_for_parent() {
+  local parent="$1"
+  set_step "collect affected CTs for ${parent}"
+  msg_info "scanning CT configs for disks under ${parent}"
+  local conf=""
+  local ctid=""
+  local key=""
+  local raw_value=""
+  local value=""
+  local volid=""
+  local storage=""
+  local volname=""
+  local dataset=""
+
+  RESTORE_AFFECTED_CTS=()
+  for conf in /etc/pve/lxc/*.conf; do
+    [ -f "$conf" ] || continue
+    ctid="${conf##*/}"
+    ctid="${ctid%.conf}"
+    while IFS='|' read -r key raw_value; do
+      value="${raw_value#"${raw_value%%[![:space:]]*}"}"
+      volid="${value%%,*}"
+      [[ "$volid" == *:* ]] || continue
+      storage="${volid%%:*}"
+      volname="${volid#*:}"
+      dataset="$(resolve_volid_dataset "$storage" "$volname" "$volid" || true)"
+      [[ "$dataset" == "${parent}"/* ]] || continue
+      if ! append_unique "$ctid" "${RESTORE_AFFECTED_CTS[@]}"; then
+        RESTORE_AFFECTED_CTS+=("$ctid")
+      fi
+      break
+    done < <(awk -F':' '/^[[:space:]]*(rootfs|mp[0-9]+)[[:space:]]*:/ {
+      key=$1
+      gsub(/[[:space:]]/, "", key)
+      sub(/^[^:]*:[[:space:]]*/, "", $0)
+      print key "|" $0
+    }' "$conf")
+  done
+  msg_ok "found ${#RESTORE_AFFECTED_CTS[@]} affected CT(s) under ${parent}"
+}
+
+collect_affected_vms_for_parent() {
+  local parent="$1"
+  set_step "collect affected VMs for ${parent}"
+  msg_info "scanning VM configs for disks under ${parent}"
+  local conf=""
+  local vmid=""
+  local key=""
+  local raw_value=""
+  local value=""
+  local volid=""
+  local storage=""
+  local volname=""
+  local dataset=""
+
+  RESTORE_AFFECTED_VMS=()
+  for conf in /etc/pve/qemu-server/*.conf; do
+    [ -f "$conf" ] || continue
+    vmid="${conf##*/}"
+    vmid="${vmid%.conf}"
+    while IFS='|' read -r key raw_value; do
+      value="${raw_value#"${raw_value%%[![:space:]]*}"}"
+      volid="${value%%,*}"
+      [[ "$volid" == *:* ]] || continue
+      storage="${volid%%:*}"
+      volname="${volid#*:}"
+      dataset="$(resolve_volid_dataset "$storage" "$volname" "$volid" || true)"
+      [[ "$dataset" == "${parent}"/* ]] || continue
+      if ! append_unique "$vmid" "${RESTORE_AFFECTED_VMS[@]}"; then
+        RESTORE_AFFECTED_VMS+=("$vmid")
+      fi
+      break
+    done < <(awk -F':' '/^[[:space:]]*((virtio|scsi|sata|ide)[0-9]+|efidisk0|tpmstate0)[[:space:]]*:/ {
+      key=$1
+      gsub(/[[:space:]]/, "", key)
+      sub(/^[^:]*:[[:space:]]*/, "", $0)
+      print key "|" $0
+    }' "$conf")
+  done
+  msg_ok "found ${#RESTORE_AFFECTED_VMS[@]} affected VM(s) under ${parent}"
 }
 
 wait_for_ct_state() {
@@ -496,9 +637,11 @@ validate_environment() {
   need_cmd pct
   need_cmd pvesm
   need_cmd qm
+  need_cmd realpath
   need_cmd sha256sum
   need_cmd sleep
   need_cmd stat
+  need_cmd systemctl
   need_cmd zfs
   msg_ok "all required commands found"
 
@@ -515,6 +658,8 @@ validate_environment() {
   [ -s "$PASS_FILE" ] || die "passphrase file is empty: $PASS_FILE"
   chmod 600 "$PASS_FILE"
   msg_ok "passphrase file OK"
+
+  check_boot_unlock_prereqs "$PASS_FILE"
 
   set_step "validate storage config"
   msg_info "checking storage config: ${STORAGE_CFG}"
@@ -629,19 +774,43 @@ migrate_children() {
 
   for source_child in "${SOURCE_CHILDREN[@]}"; do
     dest_child="${DEST_PARENT}/${source_child##*/}"
+    local child_type=""
     local child_used=""
     child_used="$(zfs get -Hp -o value used "$source_child" 2>/dev/null || echo 0)"
+    child_type="$(zfs get -H -o value type "$source_child" 2>/dev/null || echo "")"
     printf '\n'
-    msg_info "migrating ${source_child} → ${dest_child}  (estimated size: $(numfmt --to=iec-i --suffix=B "$child_used" 2>/dev/null || printf '%s bytes' "$child_used"))"
+    msg_info "migrating ${source_child} (${child_type}) → ${dest_child}  (estimated size: $(numfmt --to=iec-i --suffix=B "$child_used" 2>/dev/null || printf '%s bytes' "$child_used"))"
+
+    if [ "$child_type" != "filesystem" ] && [ "$child_type" != "volume" ]; then
+      die "unsupported child type for migration: ${source_child} (${child_type})"
+    fi
+
+    msg_info "receiving encrypted dataset ${dest_child} from ${source_child}@${SNAP_NAME}"
     if command -v pv >/dev/null 2>&1; then
       zfs send -R "${source_child}@${SNAP_NAME}" \
         | pv -s "$child_used" \
              -F '%t elapsed  %b transferred  %r  ETA %e  [%B]' \
              --interval 1 \
-        | zfs recv -u -F "$dest_child"
+        | zfs recv -u -F \
+            -x mountpoint \
+            -o encryption=aes-256-gcm \
+            -o keyformat=passphrase \
+            -o keylocation="file://${PASS_FILE}" \
+            "$dest_child"
     else
-      zfs send -R "${source_child}@${SNAP_NAME}" | zfs recv -u -F "$dest_child"
+      zfs send -R "${source_child}@${SNAP_NAME}" \
+        | zfs recv -u -F \
+            -x mountpoint \
+            -o encryption=aes-256-gcm \
+            -o keyformat=passphrase \
+            -o keylocation="file://${PASS_FILE}" \
+            "$dest_child"
     fi
+    zfs set "${PROP_NS}:migration-type=zfs-send-recv-encrypted" "$dest_child" >/dev/null 2>&1 || true
+    zfs set "${PROP_NS}:migrated-from=${source_child}" "$dest_child" >/dev/null 2>&1 || true
+    zfs set "${PROP_NS}:migration-snapshot=${SNAP_NAME}" "$dest_child" >/dev/null 2>&1 || true
+    zfs set "${PROP_NS}:migration-status=complete" "$dest_child" >/dev/null 2>&1 || true
+
     # restore original mountpoint if present; first free the path on the source
     local orig_mp="${ORIG_MOUNT["$source_child"]}"
     local source_type
@@ -677,6 +846,7 @@ migrate_children() {
     fi
 
     RECVD_DATASETS+=("$dest_child")
+    validate_migrated_child "$dest_child"
     msg_ok "migrated ${source_child}"
   done
 }
@@ -756,6 +926,19 @@ prepare_switch_unmount_sources() {
 
 # Restore previous state: restore storage.cfg, unmount dest children and remount originals
 restore_state() {
+  local vmid=""
+  local ctid=""
+  msg_info "collecting and stopping guests that use ${DEST_PARENT}"
+  collect_affected_vms_for_parent "$DEST_PARENT"
+  for vmid in "${RESTORE_AFFECTED_VMS[@]}"; do
+    stop_vm_if_needed "$vmid"
+  done
+  collect_affected_cts_for_parent "$DEST_PARENT"
+  for ctid in "${RESTORE_AFFECTED_CTS[@]}"; do
+    stop_ct_if_needed "$ctid"
+  done
+  msg_ok "stopped affected guests for restore"
+
   msg_info "locating storage.cfg backup to restore"
   local stor_bak
   stor_bak=""
@@ -854,6 +1037,12 @@ restore_state() {
         die "no mount backup found and ${DEST_PARENT} not present to recover properties"
       fi
     fi
+
+  msg_info "validating restored storage mapping"
+  local restored_pool=""
+  restored_pool="$(get_storage_pool "$SOURCE_STORAGE")"
+  [ "$restored_pool" = "$SOURCE_PARENT" ] || die "restore validation failed: ${SOURCE_STORAGE} pool is '${restored_pool}', expected '${SOURCE_PARENT}'"
+  msg_ok "storage mapping restored: ${SOURCE_STORAGE} -> ${SOURCE_PARENT}"
 }
 
 print_summary() {
@@ -870,8 +1059,12 @@ print_summary() {
   printf '  pvesm status\n'
   printf '  awk '\''/^zfspool:[[:space:]]*%s$/,/^[a-zA-Z]/{print}'\'' /etc/pve/storage.cfg\n' "$SOURCE_STORAGE"
   printf '  zfs get encryption,keystatus,mountpoint,mounted %s\n' "$DEST_PARENT"
+  printf '  zfs get -r encryption,encryptionroot,keystatus %s\n' "$DEST_PARENT"
   printf '  pct list\n'
   printf '  qm list\n'
+  printf '\nBoot unlock checks:\n'
+  printf '  systemctl is-enabled %s\n' "$BOOT_UNLOCK_SERVICE"
+  printf '  systemctl status %s --no-pager\n' "$BOOT_UNLOCK_SERVICE"
   printf '\nRollback target:\n'
   printf '  %s --restore --yes\n' "${0}"
 }

@@ -32,7 +32,7 @@ The script will:
 - stop only the affected guests
 - verify that the pool has enough free space for the duplicated data
 - create `rpool/data-enc` as an encrypted parent and ensure its key is loaded
-- migrate every direct child of `rpool/data`
+- migrate every direct child of `rpool/data` with `zfs send -R | zfs recv` while forcing encrypted receive properties (`encryption`, `keyformat`, `keylocation`) on destination children
 - switch `local-zfs` to `rpool/data-enc`
 - mount encrypted datasets under `/rpool/data-enc/...` (not `/rpool/data/...`) so Proxmox/LXC pre-start hooks resolve dataset paths correctly
 
@@ -42,6 +42,13 @@ Dry-run behavior
 Important operational note:
 - when `local-zfs` points to `rpool/data-enc`, the parent dataset must remain mountable
   (do not force `mountpoint=none` with `canmount=off`) or Proxmox pre-start hooks can fail
+
+Boot unlock is mandatory
+- the migration script now fails fast if no key-loading service is enabled
+- one supported service must be enabled before migration:
+  - `zfs-load-all-keys-from-usb.service` (recommended when passphrase/key is on USB)
+  - `zfs-load-key.service` (system-provided fallback, if available on your node)
+- if passphrase file lives under `/mnt/_USB_PENDRIVE_KEY`, `zfs-load-all-keys-from-usb.service` is required
 
 Restore mode behavior
 
@@ -77,6 +84,30 @@ Requirements:
 - the USB key must be mounted at `/mnt/_USB_PENDRIVE_KEY`
 - the passphrase or key files must already be reachable when `zfs load-key -a` runs
 - the generated mount unit must be `mnt-_USB_PENDRIVE_KEY.mount`
+
+Post-migration and post-reboot verification
+
+```bash
+# Encryption must be enabled for migrated and newly created children
+zfs get -r encryption,encryptionroot,keystatus rpool/data-enc
+
+# local-zfs must point to encrypted parent
+awk '/^zfspool:[[:space:]]*local-zfs$/,/^[a-zA-Z]/{print}' /etc/pve/storage.cfg
+
+# Boot unlock service health
+systemctl is-enabled zfs-load-all-keys-from-usb.service
+systemctl status zfs-load-all-keys-from-usb.service --no-pager
+```
+
+Troubleshooting
+- Symptom: CT fail at start with `dataset is busy` / `could not activate storage 'local-zfs'` after enabling the USB load-key unit; `systemctl show zfs-mount.service -p ConditionResult` is `no` and `zfs mount -a` never ran.
+  - Cause: an older unit used `After=local-fs.target` together with `Before=zfs-mount.service`, which breaks boot ordering (zfs-mount runs before `local-fs.target`).
+  - Fix: reinstall `zfs-load-all-keys-from-usb.service` from this repo (no `After=local-fs.target`), then `daemon-reload` and reboot.
+- Symptom: new CT/VM fails after reboot, `keystatus=unavailable` on `rpool/data-enc/*`.
+  - Fix: verify key file path exists at boot and enable/start `zfs-load-all-keys-from-usb.service`.
+- Symptom: old migrated datasets still show `encryption=off`.
+  - Cause: data was migrated with old `zfs send|recv` flow from earlier script versions.
+  - Fix: rerun migration with this updated script on clean source/target layout.
 
 Legacy per-dataset unlock helper
 

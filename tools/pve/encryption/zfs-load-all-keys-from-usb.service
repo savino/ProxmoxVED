@@ -1,7 +1,11 @@
 [Unit]
 Description=Load all ZFS encryption keys after USB key mount
 DefaultDependencies=no
-After=zfs-import.target local-fs.target
+# Order: zfs-import -> (USB mount via RequiresMountsFor) -> load-key -> zfs-mount -> ...
+# Never use After=local-fs.target here: zfs-mount.service is ordered Before=local-fs.target.
+# Combining After=local-fs and Before=zfs-mount is unsatisfiable and systemd can skip
+# zfs-mount (zfs mount -a never runs; CT rootfs paths stay wrong / "dataset is busy").
+After=zfs-import.target
 Requires=zfs-import.target
 RequiresMountsFor=/mnt/_USB_PENDRIVE_KEY
 Before=zfs-mount.service
