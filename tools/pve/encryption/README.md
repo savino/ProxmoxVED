@@ -31,9 +31,39 @@ The script will:
 - find CTs and VMs backed by datasets or zvols under `rpool/data`
 - stop only the affected guests
 - verify that the pool has enough free space for the duplicated data
-- create `rpool/data-enc` as an encrypted parent
+- create `rpool/data-enc` as an encrypted parent and ensure its key is loaded
 - migrate every direct child of `rpool/data`
 - switch `local-zfs` to `rpool/data-enc`
+- mount encrypted datasets under `/rpool/data-enc/...` (not `/rpool/data/...`) so Proxmox/LXC pre-start hooks resolve dataset paths correctly
+
+Dry-run behavior
+- `--dry-run` performs preflight validation and now also fails if `rpool/data-enc` already exists (for example after a restore where the encrypted tree was intentionally kept).
+
+Important operational note:
+- when `local-zfs` points to `rpool/data-enc`, the parent dataset must remain mountable
+  (do not force `mountpoint=none` with `canmount=off`) or Proxmox pre-start hooks can fail
+
+Restore mode behavior
+
+```bash
+sudo bash tools/pve/encryption/encrypt-rpool-data-parent.sh --restore --yes
+```
+
+The restore path now:
+- restores `/etc/pve/storage.cfg` from backup
+- unmounts `rpool/data-enc` children and sets their mountpoints to `none`
+- restores and mounts the original `rpool/data/subvol-*` datasets (from mount backup, or from saved `custom.proxmox:orig-mount` properties as fallback)
+  while checking storage paths.
+
+Useful post-check commands:
+
+```bash
+pvesm status
+awk '/^zfspool:[[:space:]]*local-zfs$/,/^[a-zA-Z]/{print}' /etc/pve/storage.cfg
+zfs get encryption,keystatus,mountpoint,mounted rpool/data-enc
+pct list
+qm list
+```
 
 Boot-time unlock using a USB key mount
 
