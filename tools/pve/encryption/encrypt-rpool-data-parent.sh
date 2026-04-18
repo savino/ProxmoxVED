@@ -290,7 +290,11 @@ validate_migrated_child() {
   key_status="$(zfs get -H -o value keystatus "$child" 2>/dev/null || echo "")"
 
   [ "$enc" != "off" ] || die "destination ${child} is not encrypted (encryption=off)"
-  [ "$encroot" = "$DEST_PARENT" ] || die "destination ${child} has unexpected encryptionroot=${encroot}"
+  # zfs recv -o encryption=... often makes the received dataset its own encryption root (encroot == child).
+  # Children created under an already-loaded encrypted parent may show encroot == DEST_PARENT instead.
+  if [ "$encroot" != "$DEST_PARENT" ] && [ "$encroot" != "$child" ]; then
+    die "destination ${child} has unexpected encryptionroot=${encroot} (expected ${DEST_PARENT} or ${child})"
+  fi
   [ "$key_status" = "available" ] || die "destination ${child} key is unavailable (${key_status})"
 
   if [ "$type" = "filesystem" ]; then
@@ -835,8 +839,12 @@ migrate_children() {
       # persist original mountpoint as a custom property for later recovery
       zfs set "${PROP_NS}:orig-mount=${orig_mp}" "$dest_child" >/dev/null 2>&1 || msg_error "failed to record original mountpoint on ${dest_child}"
       zfs set mountpoint="/${DEST_PARENT}/${source_child##*/}" "$dest_child" || msg_error "failed to set mountpoint for ${dest_child}"
-      # attempt to mount (requires key to be loaded)
-      if zfs mount "$dest_child"; then
+      # Parent may already expose this path; avoid duplicate zfs mount ("already mounted").
+      local dest_mounted=""
+      dest_mounted="$(zfs get -H -o value mounted "$dest_child" 2>/dev/null || echo "no")"
+      if [ "$dest_mounted" = "yes" ]; then
+        msg_ok "${dest_child} already mounted"
+      elif zfs mount "$dest_child"; then
         msg_ok "mounted ${dest_child}"
       else
         msg_info "could not mount ${dest_child} now; will require manual mount or key load"
