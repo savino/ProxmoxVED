@@ -19,6 +19,41 @@ Files
 - `zfs-load-lxc-keys.service` — service template for the legacy per-dataset helper.
 - `zfs-load-all-keys-from-usb.service` — service template for whole-parent
   encryption; waits for `/mnt/_USB_PENDRIVE_KEY` and then runs `zfs load-key -a`.
+- `prepare-root-encryption.sh` — online preflight + snapshot preparation for
+  encrypting `rpool/ROOT` on systems using `proxmox-boot-tool`.
+- `apply-root-encryption-initramfs.sh` — offline/initramfs migration helper for
+  `rpool/ROOT` encryption.
+- `proxmox-migration-system-report.sh` — read-only inventory report (Markdown)
+  for hardware, partitions, boot, ZFS, Proxmox, and systemd (migration planning).
+
+System migration report (read-only)
+
+```bash
+sudo bash tools/pve/encryption/proxmox-migration-system-report.sh --output /root/proxmox-migration-report.md
+```
+
+Run on the target node before tuning migration scripts; review the Markdown output offline.
+
+Encrypting rpool/ROOT (advanced)
+
+This is a high-risk operation and must be done in two phases:
+
+1) Online preparation:
+
+```bash
+sudo bash tools/pve/encryption/prepare-root-encryption.sh /mnt/_USB_PENDRIVE_KEY/proxmox-system-init.txt --yes
+```
+
+2) Offline apply from initramfs/rescue shell:
+
+```bash
+bash tools/pve/encryption/apply-root-encryption-initramfs.sh /mnt/_USB_PENDRIVE_KEY/proxmox-system-init.txt --snapshot pre-root-encrypt-YYYYMMDD-HHMMSS --yes
+```
+
+Notes:
+- Do not run `apply-root-encryption-initramfs.sh` from a normally booted rootfs.
+- Keep physical/remote-console access available.
+- Verify `proxmox-boot-tool status` after successful reboot.
 
 Whole-parent migration flow
 

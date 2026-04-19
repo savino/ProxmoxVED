@@ -117,6 +117,8 @@ SNAP_NAME="pre-parent-encrypt-${TS}"
 STORAGE_CFG="/etc/pve/storage.cfg"
 STORAGE_CFG_BAK="/root/storage.cfg.bak.${TS}"
 MOUNT_BAK="/root/orig-mounts.${TS}.txt"
+REPORT_DIR="/root/encryption"
+REPORT_FILE="${REPORT_DIR}/storage-encryption-migration-${TS}.md"
 POOL_ROOT="${SOURCE_PARENT%%/*}"
 MIN_HEADROOM_BYTES=1073741824
 SHUTDOWN_TIMEOUT=180
@@ -133,6 +135,7 @@ declare -a STOPPED_VMS=()
 declare -a RECVD_DATASETS=()
 declare -a RESTORE_AFFECTED_CTS=()
 declare -a RESTORE_AFFECTED_VMS=()
+declare -a IGNORED_PARENT_DATASETS=()
 
 CURRENT_STEP="(init)"
 set_step() { CURRENT_STEP="$*"; }
@@ -275,6 +278,28 @@ check_boot_unlock_prereqs() {
   fi
 
   die "no boot-time key loading service enabled (expected ${BOOT_UNLOCK_SERVICE} or ${zfs_load_service})"
+}
+
+collect_ignored_parent_datasets() {
+  local dataset=""
+  local root_dataset="${POOL_ROOT}/ROOT"
+
+  IGNORED_PARENT_DATASETS=()
+  set_step "collect ignored parent datasets"
+  msg_info "checking direct parent datasets under ${POOL_ROOT} outside standard scope"
+  while IFS= read -r dataset; do
+    [ -n "$dataset" ] || continue
+    [ "$dataset" = "$SOURCE_PARENT" ] && continue
+    [ "$dataset" = "$DEST_PARENT" ] && continue
+    [ "$dataset" = "$root_dataset" ] && continue
+    IGNORED_PARENT_DATASETS+=("$dataset")
+  done < <(zfs list -H -r -d 1 -o name "$POOL_ROOT" | awk -v pool="$POOL_ROOT" '$1 != pool')
+
+  if [ "${#IGNORED_PARENT_DATASETS[@]}" -gt 0 ]; then
+    msg_info "found ${#IGNORED_PARENT_DATASETS[@]} non-standard parent dataset(s); they will be ignored"
+  else
+    msg_ok "no non-standard parent datasets found"
+  fi
 }
 
 validate_migrated_child() {
@@ -626,12 +651,20 @@ print_recap() {
   for child in "${SOURCE_CHILDREN[@]}"; do
     printf '  - %s -> %s/%s\n' "$child" "$DEST_PARENT" "${child##*/}"
   done
+
+  if [ "${#IGNORED_PARENT_DATASETS[@]}" -gt 0 ]; then
+    printf 'Ignored non-standard parent datasets (outside ROOT/storage scope):\n'
+    for child in "${IGNORED_PARENT_DATASETS[@]}"; do
+      printf '  - %s\n' "$child"
+    done
+  fi
 }
 
 validate_environment() {
   local storage_type=""
   local storage_pool=""
   local enc_val=""
+  local dest_enc_val=""
 
   set_step "check required commands"
   msg_info "checking required commands"
@@ -701,6 +734,11 @@ validate_environment() {
   if [ -z "$storage_pool" ]; then
     die "could not determine pool for storage '${SOURCE_STORAGE}' in ${STORAGE_CFG} — check that 'pool' is set under '${SOURCE_STORAGE}'"
   fi
+  if [ "$storage_pool" = "$DEST_PARENT" ]; then
+    dest_enc_val="$(zfs get -H -o value encryption "$DEST_PARENT" 2>/dev/null || printf 'missing')"
+    [ "$dest_enc_val" != "off" ] || die "${SOURCE_STORAGE} already points to ${DEST_PARENT}, but destination is not encrypted"
+    die "${SOURCE_STORAGE} already points to encrypted destination ${DEST_PARENT} (encryption=${dest_enc_val}); migration already applied"
+  fi
   [ "$storage_pool" = "$SOURCE_PARENT" ] || die "${SOURCE_STORAGE} pool is '${storage_pool}', expected '${SOURCE_PARENT}'"
   msg_ok "storage pool OK: ${storage_pool}"
 
@@ -713,6 +751,72 @@ validate_environment() {
 
   set_step "check available space"
   check_space
+}
+
+write_report() {
+  local mode="$1"
+  local status="$2"
+  local dataset=""
+
+  mkdir -p "$REPORT_DIR"
+  cat <<EOF >"$REPORT_FILE"
+# Storage encryption migration report
+
+- Host: $(hostname)
+- Generated (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)
+- Script: $(basename "$0")
+- Mode: ${mode}
+- Status: ${status}
+
+## Configuration
+
+- Source storage: ${SOURCE_STORAGE}
+- Source parent: ${SOURCE_PARENT}
+- Destination parent: ${DEST_PARENT}
+- Storage backup: ${STORAGE_CFG_BAK}
+- Snapshot: ${SOURCE_PARENT}@${SNAP_NAME}
+- Passphrase file: ${PASS_FILE:-<not-used>}
+
+## Affected guests
+
+- CT count: ${#AFFECTED_CTS[@]}
+- VM count: ${#AFFECTED_VMS[@]}
+
+## Child datasets selected for migration
+
+EOF
+
+  for dataset in "${SOURCE_CHILDREN[@]}"; do
+    printf -- '- %s -> %s/%s\n' "$dataset" "$DEST_PARENT" "${dataset##*/}" >>"$REPORT_FILE"
+  done
+
+  cat <<EOF >>"$REPORT_FILE"
+
+## Migrated datasets
+
+EOF
+  if [ "${#RECVD_DATASETS[@]}" -eq 0 ]; then
+    printf -- '- none\n' >>"$REPORT_FILE"
+  else
+    for dataset in "${RECVD_DATASETS[@]}"; do
+      printf -- '- %s\n' "$dataset" >>"$REPORT_FILE"
+    done
+  fi
+
+  cat <<EOF >>"$REPORT_FILE"
+
+## Ignored non-standard parent datasets
+
+EOF
+  if [ "${#IGNORED_PARENT_DATASETS[@]}" -eq 0 ]; then
+    printf -- '- none\n' >>"$REPORT_FILE"
+  else
+    for dataset in "${IGNORED_PARENT_DATASETS[@]}"; do
+      printf -- '- %s\n' "$dataset" >>"$REPORT_FILE"
+    done
+  fi
+
+  msg_ok "migration report written to ${REPORT_FILE}"
 }
 
 migrate_children() {
@@ -1075,12 +1179,22 @@ print_summary() {
   printf '  systemctl status %s --no-pager\n' "$BOOT_UNLOCK_SERVICE"
   printf '\nRollback target:\n'
   printf '  %s --restore --yes\n' "${0}"
+  if [ "${#IGNORED_PARENT_DATASETS[@]}" -gt 0 ]; then
+    printf '\nIgnored non-standard parent datasets:\n'
+    for dataset in "${IGNORED_PARENT_DATASETS[@]}"; do
+      printf '  - %s\n' "$dataset"
+    done
+  fi
+  printf '\nReport file:\n'
+  printf '  %s\n' "$REPORT_FILE"
 }
 
 
 if [ "$RESTORE" -eq 1 ]; then
   set_step "restore state"
   restore_state
+  collect_ignored_parent_datasets
+  write_report "restore" "success"
   trap - EXIT
   print_summary
   exit 0
@@ -1088,6 +1202,9 @@ fi
 
 set_step "validate environment"
 validate_environment
+
+set_step "collect ignored parent datasets"
+collect_ignored_parent_datasets
 
 if [ "$SWITCH_ONLY" -eq 1 ]; then
   msg_info "--switch-only: skipping ZFS migration, patching storage.cfg only"
@@ -1098,6 +1215,7 @@ if [ "$SWITCH_ONLY" -eq 1 ]; then
   prepare_switch_unmount_sources
   set_step "switch storage"
   switch_storage
+  write_report "switch-only" "success"
   trap - EXIT
   print_summary
   exit 0
@@ -1115,6 +1233,7 @@ collect_affected_vms
 print_recap
 
 if [ "$DRY_RUN" -eq 1 ]; then
+  write_report "dry-run" "success"
   trap - EXIT
   printf '\n'
   msg_ok "DRY-RUN complete — no changes were made"
@@ -1156,6 +1275,8 @@ migrate_children
 
 set_step "switch storage"
 switch_storage
+
+write_report "migration" "success"
 
 trap - EXIT
 print_summary
