@@ -208,10 +208,10 @@ write_usb_unlock_hook() {
 
 PREREQ=""
 prereqs() {
-  echo "$PREREQ"
+  echo "\$PREREQ"
 }
 
-case "$1" in
+case "\$1" in
   prereqs)
     prereqs
     exit 0
@@ -225,20 +225,20 @@ KEY_LOCATOR_TYPE="${key_locator_type}"
 KEY_LOCATOR_VALUE="${key_locator_value}"
 
 KEY_DEVICE=""
-case "$KEY_LOCATOR_TYPE" in
-  uuid) KEY_DEVICE="/dev/disk/by-uuid/$KEY_LOCATOR_VALUE" ;;
+case "\$KEY_LOCATOR_TYPE" in
+  uuid) KEY_DEVICE="/dev/disk/by-uuid/\$KEY_LOCATOR_VALUE" ;;
   *) exit 0 ;;
 esac
 
-[ -b "$KEY_DEVICE" ] || exit 0
-mkdir -p "$KEY_MOUNT_POINT"
-mount -o ro "$KEY_DEVICE" "$KEY_MOUNT_POINT" >/dev/null 2>&1 || exit 0
+[ -b "\$KEY_DEVICE" ] || exit 0
+mkdir -p "\$KEY_MOUNT_POINT"
+mount -o ro "\$KEY_DEVICE" "\$KEY_MOUNT_POINT" >/dev/null 2>&1 || exit 0
 
-if [ -f "$PASS_FILE" ]; then
-  zfs load-key -L "file://$PASS_FILE" "$ROOT_DATASET" >/dev/null 2>&1 || true
+if [ -f "\$PASS_FILE" ]; then
+  zfs load-key -L "file://\$PASS_FILE" "\$ROOT_DATASET" >/dev/null 2>&1 || true
 fi
 
-umount "$KEY_MOUNT_POINT" >/dev/null 2>&1 || true
+umount "\$KEY_MOUNT_POINT" >/dev/null 2>&1 || true
 exit 0
 EOF
   chmod 0755 "$USB_UNLOCK_HOOK"
