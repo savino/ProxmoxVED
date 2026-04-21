@@ -21,6 +21,7 @@ PASS_FILE=""
 AUTO_YES=0
 KEEP_COPY=0
 SNAPSHOT_NAME=""
+RECOVERY_MODE=0
 
 POOL="rpool"
 SOURCE_ROOT="rpool/ROOT"
@@ -42,11 +43,13 @@ usage() {
   cat <<'EOF' >&2
 Usage:
   apply-root-encryption-initramfs.sh <PASS_FILE> [--snapshot <name>] [--yes] [--keep-copy]
+  apply-root-encryption-initramfs.sh [<PASS_FILE>] [--snapshot <name>] --recover-root [--yes]
 
 Options:
   --snapshot NAME      source snapshot name on rpool/ROOT (without dataset prefix)
   --yes                non-interactive confirmation
   --keep-copy          keep temporary dataset rpool/root-unencrypted-copy for manual rollback
+  --recover-root       restore unencrypted rpool/ROOT from temporary copy or snapshot
 
 PASS_FILE requirements:
   - full path under /mnt/<first-level-dir>/<file>
@@ -54,6 +57,55 @@ PASS_FILE requirements:
   - when running from initramfs shell, ensure USB is mounted and PASS_FILE exists
 EOF
   exit 1
+}
+
+import_pool_for_recovery() {
+  if zpool list -H "$POOL" >/dev/null 2>&1; then
+    return 0
+  fi
+  modprobe zfs >/dev/null 2>&1 || true
+  zpool import -N -f "$POOL"
+}
+
+restore_root_from_copy_or_snapshot() {
+  local child=""
+  local child_name=""
+  local target=""
+  local restore_src=""
+  local restore_copy="${POOL}/root-recovery-copy"
+  local rec_snap="recover-${TS}"
+
+  import_pool_for_recovery
+
+  if zfs list -H "$TEMP_ROOT" >/dev/null 2>&1; then
+    restore_src="$TEMP_ROOT"
+  else
+    [ -n "$SNAPSHOT_NAME" ] || detect_snapshot_if_missing
+    zfs list -H "${SOURCE_ROOT}@${SNAPSHOT_NAME}" >/dev/null 2>&1 || \
+      die "snapshot not found for recovery: ${SOURCE_ROOT}@${SNAPSHOT_NAME}"
+    zfs list -H "$restore_copy" >/dev/null 2>&1 && zfs destroy -r "$restore_copy" >/dev/null 2>&1 || true
+    zfs send -R "${SOURCE_ROOT}@${SNAPSHOT_NAME}" | zfs recv -u -F "$restore_copy"
+    restore_src="$restore_copy"
+  fi
+
+  zfs snapshot -r "${restore_src}@${rec_snap}"
+
+  zfs list -H "$SOURCE_ROOT" >/dev/null 2>&1 && zfs destroy -r "$SOURCE_ROOT" || true
+  zfs create -o mountpoint="/rpool/ROOT" -o canmount=off "$SOURCE_ROOT"
+
+  while IFS= read -r child; do
+    [ -n "$child" ] || continue
+    [ "$child" = "$restore_src" ] && continue
+    child_name="${child##*/}"
+    target="${SOURCE_ROOT}/${child_name}"
+    zfs send -R "${child}@${rec_snap}" | zfs recv -u -F "$target"
+  done < <(zfs list -H -r -d 1 -o name "$restore_src")
+
+  zfs list -H "${SOURCE_ROOT}/${ROOT_CHILD_EXPECTED}" >/dev/null 2>&1 || \
+    die "expected boot dataset missing after recovery: ${SOURCE_ROOT}/${ROOT_CHILD_EXPECTED}"
+  zpool set bootfs="${SOURCE_ROOT}/${ROOT_CHILD_EXPECTED}" "$POOL"
+
+  [ "$restore_src" = "$restore_copy" ] && zfs destroy -r "$restore_copy" >/dev/null 2>&1 || true
 }
 
 validate_passfile_layout() {
@@ -205,10 +257,23 @@ print_summary() {
   printf '  proxmox-boot-tool status\n'
 }
 
+print_recovery_summary() {
+  printf '\nROOT recovery completed.\n'
+  printf 'Pool bootfs: %s/%s\n' "$SOURCE_ROOT" "$ROOT_CHILD_EXPECTED"
+  if [ -n "$SNAPSHOT_NAME" ]; then
+    printf 'Snapshot hint used: %s@%s\n' "$SOURCE_ROOT" "$SNAPSHOT_NAME"
+  fi
+  printf '\nRun after normal boot:\n'
+  printf '  zfs get encryption,encryptionroot,keystatus %s %s/%s\n' "$SOURCE_ROOT" "$SOURCE_ROOT" "$ROOT_CHILD_EXPECTED"
+  printf '  zpool get bootfs %s\n' "$POOL"
+  printf '  proxmox-boot-tool status\n'
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --yes) AUTO_YES=1; shift ;;
     --keep-copy) KEEP_COPY=1; shift ;;
+    --recover-root) RECOVERY_MODE=1; shift ;;
     --snapshot)
       [ "$#" -ge 2 ] || die "--snapshot requires a value"
       SNAPSHOT_NAME="$2"
@@ -226,6 +291,21 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+if [ "$RECOVERY_MODE" -eq 1 ]; then
+  need_cmd awk
+  need_cmd modprobe
+  need_cmd zfs
+  need_cmd zpool
+  [ "$(id -u)" -eq 0 ] || die "run as root"
+  if [ -n "$PASS_FILE" ]; then
+    validate_passfile_layout "$(realpath "$PASS_FILE" 2>/dev/null || printf '%s' "$PASS_FILE")"
+  fi
+  confirm_or_abort "Restore ${SOURCE_ROOT} from temporary copy or snapshot?"
+  restore_root_from_copy_or_snapshot
+  print_recovery_summary
+  exit 0
+fi
 
 [ -n "$PASS_FILE" ] || usage
 

@@ -39,6 +39,13 @@ BACKUP_DIR="${WORKDIR}/file-backups"
 CHECKLIST_FILE="${WORKDIR}/CHECKLIST.txt"
 CREATED_PATHS_FILE="${WORKDIR}/created-paths.txt"
 STATE_FILE="/root/.root-encrypt-prepare-state"
+AUTOMATION_DIR="/etc/pve-root-encrypt"
+AUTOMATION_APPLY_FILE="${AUTOMATION_DIR}/apply-root-encryption-initramfs.sh"
+INITRAMFS_EMBED_HOOK="/etc/initramfs-tools/hooks/pve-encrypt-embed"
+INITRAMFS_AUTO_APPLY_HOOK="/etc/initramfs-tools/scripts/local-top/pve-encrypt-apply"
+ESP_ENCRYPT_DIR_REL="/EFI/proxmox/pve-encrypt"
+ESP_STATE_FILE_REL="${ESP_ENCRYPT_DIR_REL}/state"
+ESP_LOG_FILE_REL="${ESP_ENCRYPT_DIR_REL}/apply.log"
 BACKUP_COUNT=0
 USB_SOURCE_DEVICE=""
 USB_LOCATOR_TYPE=""
@@ -53,6 +60,7 @@ BOOT_REFRESH_ACTION="none"
 ESP_BACKUP_KERNEL_REL=""
 ESP_BACKUP_INITRD_REL=""
 SYSTEMD_BOOT_ENTRY_ID=""
+STATE_ESP_UUIDS_CSV=""
 declare -a ESP_UUIDS=()
 
 die() {
@@ -125,6 +133,87 @@ clear_active_state() {
   rm -f "$STATE_FILE"
 }
 
+build_state_esp_uuid_csv() {
+  if [ "${#ESP_UUIDS[@]}" -gt 0 ]; then
+    STATE_ESP_UUIDS_CSV="${ESP_UUIDS[*]}"
+  else
+    STATE_ESP_UUIDS_CSV=""
+  fi
+}
+
+write_state_payload() {
+  local target_file="$1"
+  local state_value="$2"
+
+  mkdir -p "$(dirname "$target_file")"
+  cat <<EOF >"$target_file"
+state=${state_value}
+pool=${POOL}
+source_root=${SOURCE_ROOT}
+root_child=${ROOT_CHILD}
+pass_file=${PASS_FILE}
+snapshot=${SNAP_NAME}
+unlock_method=${UNLOCK_METHOD}
+timestamp=${TS}
+attempts=0
+last_error=
+plan_dir=${WORKDIR}
+log=${ESP_LOG_FILE_REL}
+boot_layout=${BOOT_LAYOUT}
+esp_uuids=${STATE_ESP_UUIDS_CSV}
+EOF
+}
+
+write_pending_state_on_boot_targets() {
+  local uuid=""
+  local mount_dir=""
+
+  build_state_esp_uuid_csv
+  case "$BOOT_LAYOUT" in
+    proxmox-boot-tool-grub|proxmox-boot-tool-systemd-boot)
+      [ "${#ESP_UUIDS[@]}" -gt 0 ] || die "cannot write pending state: missing ESP UUIDs"
+      for uuid in "${ESP_UUIDS[@]}"; do
+        mount_dir="/mnt/pve-root-encrypt-state-${uuid}"
+        mount_esp_rw_by_uuid "$uuid" "$mount_dir"
+        write_state_payload "${mount_dir}${ESP_STATE_FILE_REL}" "pending"
+        umount "$mount_dir"
+      done
+      ;;
+    grub|grub-bios|systemd-boot|unknown)
+      if mountpoint -q /boot/efi; then
+        write_state_payload "/boot/efi${ESP_STATE_FILE_REL}" "pending"
+      elif mountpoint -q /efi; then
+        write_state_payload "/efi${ESP_STATE_FILE_REL}" "pending"
+      else
+        die "unable to locate mounted ESP for state file write"
+      fi
+      ;;
+  esac
+}
+
+clear_state_from_boot_targets() {
+  local uuid=""
+  local mount_dir=""
+
+  case "$BOOT_LAYOUT" in
+    proxmox-boot-tool-grub|proxmox-boot-tool-systemd-boot)
+      for uuid in "${ESP_UUIDS[@]}"; do
+        mount_dir="/mnt/pve-root-encrypt-state-${uuid}"
+        mount_esp_rw_by_uuid "$uuid" "$mount_dir"
+        rm -f "${mount_dir}${ESP_STATE_FILE_REL}" "${mount_dir}${ESP_LOG_FILE_REL}"
+        umount "$mount_dir"
+      done
+      ;;
+    grub|grub-bios|systemd-boot|unknown)
+      if mountpoint -q /boot/efi; then
+        rm -f "/boot/efi${ESP_STATE_FILE_REL}" "/boot/efi${ESP_LOG_FILE_REL}"
+      elif mountpoint -q /efi; then
+        rm -f "/efi${ESP_STATE_FILE_REL}" "/efi${ESP_LOG_FILE_REL}"
+      fi
+      ;;
+  esac
+}
+
 ensure_prepare_not_already_active() {
   local active_plan=""
   local legacy_plan=""
@@ -189,6 +278,9 @@ restore_from_plan() {
   remove_created_paths_from_plan "$plan_dir"
 
   detect_boot_layout
+  rm -f "$INITRAMFS_EMBED_HOOK" "$INITRAMFS_AUTO_APPLY_HOOK" "$AUTOMATION_APPLY_FILE"
+  clear_state_from_boot_targets
+
   update-initramfs -u -k all
   case "$BOOT_LAYOUT" in
     proxmox-boot-tool-grub|proxmox-boot-tool-systemd-boot)
@@ -327,62 +419,6 @@ detect_usb_locator_from_passfile() {
     "${KEY_MOUNT_POINT}"/*) ;;
     *) die "PASS_FILE must be under detected mountpoint ${KEY_MOUNT_POINT} (current: ${pass_real})" ;;
   esac
-}
-
-write_usb_unlock_hook() {
-  local root_dataset="$SOURCE_ROOT"
-  local pass_file="$PASS_FILE"
-  local key_mount_point="$KEY_MOUNT_POINT"
-  local key_locator_type="$USB_LOCATOR_TYPE"
-  local key_locator_value="$USB_LOCATOR_VALUE"
-
-  if ! unlock_method_uses_usb; then
-    return 0
-  fi
-
-  [ -n "$key_locator_value" ] || die "missing UUID locator for USB unlock hook"
-  backup_file "$USB_UNLOCK_HOOK"
-
-  mkdir -p "$(dirname "$USB_UNLOCK_HOOK")"
-  cat <<EOF >"$USB_UNLOCK_HOOK"
-#!/bin/sh
-
-PREREQ=""
-prereqs() {
-  echo "\$PREREQ"
-}
-
-case "\$1" in
-  prereqs)
-    prereqs
-    exit 0
-    ;;
-esac
-
-ROOT_DATASET="${root_dataset}"
-PASS_FILE="${pass_file}"
-KEY_MOUNT_POINT="${key_mount_point}"
-KEY_LOCATOR_TYPE="${key_locator_type}"
-KEY_LOCATOR_VALUE="${key_locator_value}"
-
-KEY_DEVICE=""
-case "\$KEY_LOCATOR_TYPE" in
-  uuid) KEY_DEVICE="/dev/disk/by-uuid/\$KEY_LOCATOR_VALUE" ;;
-  *) exit 0 ;;
-esac
-
-[ -b "\$KEY_DEVICE" ] || exit 0
-mkdir -p "\$KEY_MOUNT_POINT"
-mount -o ro "\$KEY_DEVICE" "\$KEY_MOUNT_POINT" >/dev/null 2>&1 || exit 0
-
-if [ -f "\$PASS_FILE" ]; then
-  zfs load-key -L "file://\$PASS_FILE" "\$ROOT_DATASET" >/dev/null 2>&1 || true
-fi
-
-umount "\$KEY_MOUNT_POINT" >/dev/null 2>&1 || true
-exit 0
-EOF
-  chmod 0755 "$USB_UNLOCK_HOOK"
 }
 
 create_backup_boot_entry() {
@@ -628,6 +664,9 @@ Unlock method: ${UNLOCK_METHOD}
 [x] Boot layout detected: ${BOOT_LAYOUT}
 [x] Snapshot prep: ${snapshot_status}
 [x] Modified file backups: ${BACKUP_COUNT}
+[x] Auto-apply hook: ${INITRAMFS_AUTO_APPLY_HOOK}
+[x] Initramfs embed hook: ${INITRAMFS_EMBED_HOOK}
+[x] ESP state file: ${ESP_STATE_FILE_REL}
 [x] Initramfs rebuilt: update-initramfs -u -k all
 [x] Boot config refresh: ${BOOT_REFRESH_ACTION}
 [x] Backup initrd entry: ${BOOT_ENTRY_STATUS}
@@ -870,6 +909,11 @@ Locator selected:  ${USB_LOCATOR_TYPE:-<not-set>}=${USB_LOCATOR_VALUE:-<not-set>
 Dropbear conf:     ${DROPBEAR_CONF}
 Dropbear keys:     ${DROPBEAR_AUTH_KEYS}
 USB unlock hook:   ${USB_UNLOCK_HOOK}
+Auto apply hook:   ${INITRAMFS_AUTO_APPLY_HOOK}
+Embed hook:        ${INITRAMFS_EMBED_HOOK}
+Embedded apply:    ${AUTOMATION_APPLY_FILE}
+ESP state file:    ${ESP_STATE_FILE_REL}
+ESP log file:      ${ESP_LOG_FILE_REL}
 Backups dir:       ${BACKUP_DIR}
 Created paths:     ${CREATED_PATHS_FILE}
 Checklist file:    ${CHECKLIST_FILE}
@@ -921,6 +965,10 @@ print_summary() {
   printf 'Locator used:  %s=%s\n' "${USB_LOCATOR_TYPE:-<not-set>}" "${USB_LOCATOR_VALUE:-<not-set>}"
   printf 'File backups:  %s (files: %s)\n' "$BACKUP_DIR" "$BACKUP_COUNT"
   printf 'Created paths: %s\n' "$CREATED_PATHS_FILE"
+  printf 'Auto hook:     %s\n' "$INITRAMFS_AUTO_APPLY_HOOK"
+  printf 'Embed hook:    %s\n' "$INITRAMFS_EMBED_HOOK"
+  printf 'Embedded apply:%s\n' " ${AUTOMATION_APPLY_FILE}"
+  printf 'ESP state file:%s\n' " ${ESP_STATE_FILE_REL}"
   printf 'Checklist:     %s\n' "$CHECKLIST_FILE"
   printf 'Backup kernel: %s\n' "${BACKUP_KERNEL_PATH:-<not-set>}"
   printf 'Backup initrd: %s\n' "${BACKUP_INITRD_PATH:-<not-set>}"
@@ -934,6 +982,305 @@ print_summary() {
   print_initramfs_howto
 }
 
+write_usb_unlock_hook() {
+  local root_dataset="$SOURCE_ROOT"
+  local pass_file="$PASS_FILE"
+  local key_mount_point="$KEY_MOUNT_POINT"
+  local key_locator_type="$USB_LOCATOR_TYPE"
+  local key_locator_value="$USB_LOCATOR_VALUE"
+
+  if ! unlock_method_uses_usb; then
+    return 0
+  fi
+
+  [ -n "$key_locator_value" ] || die "missing UUID locator for USB unlock hook"
+  backup_file "$USB_UNLOCK_HOOK"
+
+  mkdir -p "$(dirname "$USB_UNLOCK_HOOK")"
+  cat <<EOF >"$USB_UNLOCK_HOOK"
+#!/bin/sh
+
+PREREQ=""
+prereqs() {
+  echo "\$PREREQ"
+}
+
+case "\$1" in
+  prereqs)
+    prereqs
+    exit 0
+    ;;
+esac
+
+ROOT_DATASET="${root_dataset}"
+PASS_FILE="${pass_file}"
+KEY_MOUNT_POINT="${key_mount_point}"
+KEY_LOCATOR_TYPE="${key_locator_type}"
+KEY_LOCATOR_VALUE="${key_locator_value}"
+
+KEY_DEVICE=""
+case "\$KEY_LOCATOR_TYPE" in
+  uuid) KEY_DEVICE="/dev/disk/by-uuid/\$KEY_LOCATOR_VALUE" ;;
+  *) exit 0 ;;
+esac
+
+[ -b "\$KEY_DEVICE" ] || exit 0
+mkdir -p "\$KEY_MOUNT_POINT"
+mount -o ro "\$KEY_DEVICE" "\$KEY_MOUNT_POINT" >/dev/null 2>&1 || exit 0
+
+if [ -f "\$PASS_FILE" ]; then
+  zfs load-key -L "file://\$PASS_FILE" "\$ROOT_DATASET" >/dev/null 2>&1 || true
+fi
+
+umount "\$KEY_MOUNT_POINT" >/dev/null 2>&1 || true
+exit 0
+EOF
+  chmod 0755 "$USB_UNLOCK_HOOK"
+}
+
+resolve_apply_script_source() {
+  local self_dir=""
+  self_dir="$(cd "$(dirname "$0")" && pwd)"
+  printf '%s\n' "${self_dir}/apply-root-encryption-initramfs.sh"
+}
+
+write_initramfs_embed_hook() {
+  backup_file "$INITRAMFS_EMBED_HOOK"
+  mkdir -p "$(dirname "$INITRAMFS_EMBED_HOOK")"
+  cat <<'EOF' >"$INITRAMFS_EMBED_HOOK"
+#!/bin/sh
+set -eu
+
+PREREQ=""
+prereqs() {
+  echo "$PREREQ"
+}
+
+case "$1" in
+  prereqs)
+    prereqs
+    exit 0
+    ;;
+esac
+
+mkdir -p "${DESTDIR}/root/pve-encrypt"
+mkdir -p "${DESTDIR}/scripts/local-top"
+
+cp -a /etc/pve-root-encrypt/apply-root-encryption-initramfs.sh "${DESTDIR}/root/pve-encrypt/apply-root-encryption-initramfs.sh"
+chmod 0755 "${DESTDIR}/root/pve-encrypt/apply-root-encryption-initramfs.sh"
+
+cp -a /etc/initramfs-tools/scripts/local-top/pve-encrypt-apply "${DESTDIR}/scripts/local-top/pve-encrypt-apply"
+chmod 0755 "${DESTDIR}/scripts/local-top/pve-encrypt-apply"
+EOF
+  chmod 0755 "$INITRAMFS_EMBED_HOOK"
+}
+
+write_initramfs_auto_apply_hook() {
+  backup_file "$INITRAMFS_AUTO_APPLY_HOOK"
+  mkdir -p "$(dirname "$INITRAMFS_AUTO_APPLY_HOOK")"
+  cat <<EOF >"$INITRAMFS_AUTO_APPLY_HOOK"
+#!/bin/sh
+
+PREREQ="zfs-root-usb-key-unlock"
+prereqs() {
+  echo "\$PREREQ"
+}
+
+case "\$1" in
+  prereqs)
+    prereqs
+    exit 0
+    ;;
+esac
+
+LOCK_FILE="/run/pve-encrypt-apply.lock"
+ESP_MNT="/run/pve-encrypt-esp"
+STATE_REL="${ESP_STATE_FILE_REL}"
+LOG_REL="${ESP_LOG_FILE_REL}"
+ESP_UUIDS="${STATE_ESP_UUIDS_CSV}"
+APPLY_SCRIPT="/root/pve-encrypt/apply-root-encryption-initramfs.sh"
+TMP_LOG="/tmp/pve-encrypt-apply.log"
+
+STATE=""
+POOL=""
+SOURCE_ROOT=""
+ROOT_CHILD=""
+PASS_FILE=""
+SNAPSHOT=""
+UNLOCK_METHOD=""
+TIMESTAMP=""
+PLAN_DIR=""
+ATTEMPTS=0
+LAST_ERROR=""
+BOOT_LAYOUT=""
+
+msg() { echo "[pve-encrypt-apply] \$*"; }
+
+mount_state_esp_rw() {
+  local uuid=""
+  mkdir -p "\$ESP_MNT"
+  for uuid in \$ESP_UUIDS; do
+    [ -b "/dev/disk/by-uuid/\$uuid" ] || continue
+    mountpoint -q "\$ESP_MNT" && umount "\$ESP_MNT" >/dev/null 2>&1 || true
+    if mount -o rw "/dev/disk/by-uuid/\$uuid" "\$ESP_MNT" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+umount_state_esp() { mountpoint -q "\$ESP_MNT" && umount "\$ESP_MNT" >/dev/null 2>&1 || true; }
+
+load_state() {
+  local file="\$ESP_MNT\$STATE_REL"
+  [ -f "\$file" ] || return 1
+  while IFS='=' read -r key value; do
+    case "\$key" in
+      state) STATE="\$value" ;;
+      pool) POOL="\$value" ;;
+      source_root) SOURCE_ROOT="\$value" ;;
+      root_child) ROOT_CHILD="\$value" ;;
+      pass_file) PASS_FILE="\$value" ;;
+      snapshot) SNAPSHOT="\$value" ;;
+      unlock_method) UNLOCK_METHOD="\$value" ;;
+      timestamp) TIMESTAMP="\$value" ;;
+      attempts) ATTEMPTS="\$value" ;;
+      last_error) LAST_ERROR="\$value" ;;
+      plan_dir) PLAN_DIR="\$value" ;;
+      boot_layout) BOOT_LAYOUT="\$value" ;;
+    esac
+  done <"\$file"
+  [ -n "\$STATE" ]
+}
+
+write_state() {
+  local new_state="\$1"
+  local new_error="\${2:-}"
+  local attempts="\$ATTEMPTS"
+  [ "\$new_state" = "running" ] && attempts=\$((attempts + 1))
+  mkdir -p "\$ESP_MNT$(dirname "\$STATE_REL")"
+  cat <<STATEEOF >"\$ESP_MNT\$STATE_REL"
+state=\$new_state
+pool=\$POOL
+source_root=\$SOURCE_ROOT
+root_child=\$ROOT_CHILD
+pass_file=\$PASS_FILE
+snapshot=\$SNAPSHOT
+unlock_method=\$UNLOCK_METHOD
+timestamp=\$TIMESTAMP
+attempts=\$attempts
+last_error=\$new_error
+plan_dir=\$PLAN_DIR
+log=\$LOG_REL
+boot_layout=\$BOOT_LAYOUT
+esp_uuids=\$ESP_UUIDS
+STATEEOF
+  ATTEMPTS="\$attempts"
+  LAST_ERROR="\$new_error"
+  STATE="\$new_state"
+}
+
+flush_log() {
+  mkdir -p "\$ESP_MNT$(dirname "\$LOG_REL")"
+  [ -f "\$TMP_LOG" ] && cp -a "\$TMP_LOG" "\$ESP_MNT\$LOG_REL"
+}
+
+open_recovery_menu() {
+  local choice=""
+  msg "Apply state=\$STATE (error=\$LAST_ERROR)."
+  while :; do
+    echo ""
+    echo "pve-encrypt recovery menu"
+    echo "1) Attempt ROOT restore from copy/snapshot"
+    echo "2) Open emergency shell"
+    echo "3) Reboot"
+    printf "Choice [1-3]: "
+    read -r choice
+    case "\$choice" in
+      1)
+        if "\$APPLY_SCRIPT" "\$PASS_FILE" --snapshot "\$SNAPSHOT" --yes --recover-root >"\$TMP_LOG" 2>&1; then
+          write_state "recovered" ""
+          flush_log
+          umount_state_esp
+          reboot -f
+          echo b > /proc/sysrq-trigger
+        else
+          write_state "failed" "recovery_failed"
+          flush_log
+          /bin/sh
+        fi
+        ;;
+      2) /bin/sh ;;
+      3)
+        umount_state_esp
+        reboot -f
+        echo b > /proc/sysrq-trigger
+        ;;
+      *) msg "Invalid choice." ;;
+    esac
+  done
+}
+
+[ -e "\$LOCK_FILE" ] && exit 0
+touch "\$LOCK_FILE"
+mount_state_esp_rw || exit 0
+load_state || { umount_state_esp; exit 0; }
+
+case "\$STATE" in
+  completed|recovered) umount_state_esp; exit 0 ;;
+  running)
+    write_state "failed" "interrupted_previous_run"
+    flush_log
+    open_recovery_menu
+    ;;
+  failed)
+    flush_log
+    open_recovery_menu
+    ;;
+  pending) ;;
+  *) umount_state_esp; exit 0 ;;
+esac
+
+if [ ! -x "\$APPLY_SCRIPT" ]; then
+  write_state "failed" "apply_script_missing"
+  flush_log
+  open_recovery_menu
+fi
+
+write_state "running" ""
+if "\$APPLY_SCRIPT" "\$PASS_FILE" --snapshot "\$SNAPSHOT" --yes >"\$TMP_LOG" 2>&1; then
+  write_state "completed" ""
+  flush_log
+  umount_state_esp
+  reboot -f
+  echo b > /proc/sysrq-trigger
+else
+  write_state "failed" "apply_failed"
+  flush_log
+  open_recovery_menu
+fi
+
+umount_state_esp
+exit 0
+EOF
+  chmod 0755 "$INITRAMFS_AUTO_APPLY_HOOK"
+}
+
+install_initramfs_automation_assets() {
+  local apply_source=""
+
+  apply_source="$(resolve_apply_script_source)"
+  [ -f "$apply_source" ] || die "apply script not found near prepare script: ${apply_source}"
+  build_state_esp_uuid_csv
+
+  backup_file "$AUTOMATION_APPLY_FILE"
+  mkdir -p "$AUTOMATION_DIR"
+  cp -a "$apply_source" "$AUTOMATION_APPLY_FILE"
+  chmod 0755 "$AUTOMATION_APPLY_FILE"
+
+  write_initramfs_auto_apply_hook
+  write_initramfs_embed_hook
+}
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --yes) AUTO_YES=1; shift ;;
@@ -987,6 +1334,8 @@ confirm_or_abort "Prepare root dataset encryption for ${SOURCE_ROOT}? This is a 
 init_workdir
 configure_usb_prereqs
 configure_dropbear_prereqs
+install_initramfs_automation_assets
+write_pending_state_on_boot_targets
 rebuild_initramfs_and_refresh_boot
 create_snapshot
 write_checklist
