@@ -891,7 +891,7 @@ print_initramfs_howto() {
 write_plan() {
   mkdir -p "$WORKDIR"
   cat <<EOF >"$PLAN_FILE"
-Root encryption prep complete.
+Root encryption preparation complete.
 
 Timestamp:         ${TS}
 Pool:              ${POOL}
@@ -922,40 +922,28 @@ Backup initrd:     ${BACKUP_INITRD_PATH:-<not-set>}
 Boot backup entry: ${BOOT_ENTRY_STATUS}
 State file:        ${STATE_FILE}
 
-Important:
-- Next step must run from initramfs shell (or equivalent rescue shell), not from
-  normal booted rootfs.
-- Use apply-root-encryption-initramfs.sh with this snapshot.
+Next steps:
+- Reboot the system. The encryption apply process will run automatically in initramfs before root is mounted.
+- If the process is interrupted or fails, a recovery menu will appear at boot, allowing you to retry, restore, or open a shell.
+- After successful encryption, the system will boot normally.
 
-Suggested offline command:
-  bash tools/pve/encryption/apply-root-encryption-initramfs.sh "${PASS_FILE}" --snapshot "${SNAP_NAME}" --yes
-
-Restore command (if you want to revert prepare changes):
+To revert all changes (restore original files and configuration):
   bash tools/pve/encryption/prepare-root-encryption.sh --restore "${WORKDIR}"
 
-Initramfs/boot actions completed by prepare script:
-  update-initramfs -u -k all
-  ${BOOT_REFRESH_ACTION}
-
-Post-boot checks:
+Post-boot checks (after successful encryption):
   zfs get encryption,encryptionroot,keystatus rpool/ROOT rpool/ROOT/pve-1
   zpool get bootfs rpool
   proxmox-boot-tool status
 EOF
-
-  {
-    printf '\n'
-    print_initramfs_howto
-  } >>"$PLAN_FILE"
 }
 
 print_summary() {
-  printf '\nPreparation complete.\n'
-  printf 'Plan file: %s\n' "$PLAN_FILE"
+  printf '\nPreparazione completata.\n'
+  printf 'File piano: %s\n' "$PLAN_FILE"
   if [ "$SKIP_SNAPSHOT" -eq 0 ]; then
     printf 'Snapshot:  %s\n' "$SNAP_FULL"
   fi
-  printf 'Unlock method: %s\n' "$UNLOCK_METHOD"
+  printf 'Metodo unlock: %s\n' "$UNLOCK_METHOD"
   printf 'Boot layout:   %s\n' "$BOOT_LAYOUT"
   printf 'Key UUID:      %s\n' "${USB_LOCATOR_VALUE:-<not-set>}"
   printf 'Key PARTUUID:  %s\n' "${USB_PARTUUID:-<not-set>}"
@@ -963,8 +951,8 @@ print_summary() {
   printf 'USB FS type:   %s\n' "${USB_FS_TYPE:-<not-set>}"
   printf 'Source device: %s\n' "${USB_SOURCE_DEVICE:-<not-set>}"
   printf 'Locator used:  %s=%s\n' "${USB_LOCATOR_TYPE:-<not-set>}" "${USB_LOCATOR_VALUE:-<not-set>}"
-  printf 'File backups:  %s (files: %s)\n' "$BACKUP_DIR" "$BACKUP_COUNT"
-  printf 'Created paths: %s\n' "$CREATED_PATHS_FILE"
+  printf 'Backup file:   %s (files: %s)\n' "$BACKUP_DIR" "$BACKUP_COUNT"
+  printf 'Percorsi creati: %s\n' "$CREATED_PATHS_FILE"
   printf 'Auto hook:     %s\n' "$INITRAMFS_AUTO_APPLY_HOOK"
   printf 'Embed hook:    %s\n' "$INITRAMFS_EMBED_HOOK"
   printf 'Embedded apply:%s\n' " ${AUTOMATION_APPLY_FILE}"
@@ -978,8 +966,16 @@ print_summary() {
     printf 'Dropbear conf: %s\n' "$DROPBEAR_CONF"
     printf 'Dropbear keys: %s\n' "$DROPBEAR_AUTH_KEYS"
   fi
-  printf '\n'
-  print_initramfs_howto
+  printf '\nProssimi passi:\n'
+  printf '-- Riavvia il sistema. L\'applicazione della cifratura verrà eseguita automaticamente in initramfs prima del mount di root.\n'
+  printf '-- In caso di errore o interruzione, apparirà un menu di recovery al boot per riprovare, ripristinare o aprire una shell.\n'
+  printf '-- Dopo il successo, il sistema avvierà normalmente.\n'
+  printf '\nPer annullare tutte le modifiche (restore):\n'
+  printf '  bash tools/pve/encryption/prepare-root-encryption.sh --restore "%s"\n' "$WORKDIR"
+  printf '\nDopo il boot, controlla:\n'
+  printf '  zfs get encryption,encryptionroot,keystatus rpool/ROOT rpool/ROOT/pve-1\n'
+  printf '  zpool get bootfs rpool\n'
+  printf '  proxmox-boot-tool status\n'
 }
 
 write_usb_unlock_hook() {
@@ -1049,7 +1045,6 @@ write_initramfs_embed_hook() {
   mkdir -p "$(dirname "$INITRAMFS_EMBED_HOOK")"
   cat <<'EOF' >"$INITRAMFS_EMBED_HOOK"
 #!/bin/sh
-set -eu
 
 PREREQ=""
 prereqs() {
