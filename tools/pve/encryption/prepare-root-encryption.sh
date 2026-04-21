@@ -14,6 +14,8 @@ set -Eeuo pipefail
 PASS_FILE=""
 AUTO_YES=0
 SKIP_SNAPSHOT=0
+RESTORE_MODE=0
+RESTORE_PLAN_DIR=""
 KEY_MOUNT_POINT=""
 UNLOCK_METHOD=""
 INSTALL_DROPBEAR=0
@@ -35,6 +37,8 @@ USB_UNLOCK_HOOK="/etc/initramfs-tools/scripts/local-top/zfs-root-usb-key-unlock"
 GRUB_CUSTOM_FILE="/etc/grub.d/40_custom"
 BACKUP_DIR="${WORKDIR}/file-backups"
 CHECKLIST_FILE="${WORKDIR}/CHECKLIST.txt"
+CREATED_PATHS_FILE="${WORKDIR}/created-paths.txt"
+STATE_FILE="/root/.root-encrypt-prepare-state"
 BACKUP_COUNT=0
 USB_SOURCE_DEVICE=""
 USB_LOCATOR_TYPE=""
@@ -44,6 +48,12 @@ BACKUP_KERNEL_PATH=""
 BACKUP_INITRD_PATH=""
 BOOT_ENTRY_STATUS="not-configured"
 USB_FS_TYPE=""
+BOOT_LAYOUT="unknown"
+BOOT_REFRESH_ACTION="none"
+ESP_BACKUP_KERNEL_REL=""
+ESP_BACKUP_INITRD_REL=""
+SYSTEMD_BOOT_ENTRY_ID=""
+declare -a ESP_UUIDS=()
 
 die() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -58,10 +68,12 @@ usage() {
   cat <<'EOF' >&2
 Usage:
   prepare-root-encryption.sh <PASS_FILE> [--yes] [--skip-snapshot] [--unlock-method <usb|dropbear|both>] [--install-dropbear]
+  prepare-root-encryption.sh --restore [PLAN_DIR] [--yes]
 
 Options:
   --yes                 non-interactive confirmation
   --skip-snapshot       do not create a new rpool/ROOT recursive snapshot
+  --restore [PLAN_DIR]  restore modified files from latest or selected root-encrypt-plan-* directory
   --unlock-method MODE  root unlock strategy in initramfs: usb, dropbear, both
   --install-dropbear    install missing dropbear-initramfs package automatically
 
@@ -74,16 +86,145 @@ EOF
   exit 1
 }
 
+init_workdir() {
+  mkdir -p "$WORKDIR"
+  mkdir -p "$BACKUP_DIR"
+  touch "$CREATED_PATHS_FILE"
+}
+
+list_plan_dirs() {
+  find /root -maxdepth 1 -type d -name 'root-encrypt-plan-*' 2>/dev/null | sort
+}
+
+list_unrestored_plan_dirs() {
+  local d=""
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    [ -f "${d}/.restored" ] && continue
+    printf '%s\n' "$d"
+  done < <(list_plan_dirs)
+}
+
+latest_unrestored_plan_dir() {
+  list_unrestored_plan_dirs | tail -n1
+}
+
+write_active_state() {
+  cat <<EOF >"$STATE_FILE"
+STATUS=prepared
+PLAN_DIR=${WORKDIR}
+TIMESTAMP=${TS}
+SNAPSHOT=${SNAP_FULL}
+UNLOCK_METHOD=${UNLOCK_METHOD}
+EOF
+  chmod 0600 "$STATE_FILE"
+}
+
+clear_active_state() {
+  [ -f "$STATE_FILE" ] || return 0
+  rm -f "$STATE_FILE"
+}
+
+ensure_prepare_not_already_active() {
+  local active_plan=""
+  local legacy_plan=""
+
+  if [ -f "$STATE_FILE" ]; then
+    active_plan="$(awk -F= '/^PLAN_DIR=/{print $2}' "$STATE_FILE" | tail -n1)"
+    die "prepare already active${active_plan:+ (plan: ${active_plan})}. Run --restore first."
+  fi
+
+  legacy_plan="$(latest_unrestored_plan_dir)"
+  if [ -n "$legacy_plan" ]; then
+    die "existing unrestored plan detected (${legacy_plan}). To avoid layered backups, run --restore first."
+  fi
+}
+
+resolve_restore_plan_dir() {
+  local selected=""
+  local count=""
+  if [ -n "$RESTORE_PLAN_DIR" ]; then
+    [ -d "$RESTORE_PLAN_DIR" ] || die "restore plan directory not found: $RESTORE_PLAN_DIR"
+    selected="$RESTORE_PLAN_DIR"
+  else
+    selected="$(latest_unrestored_plan_dir)"
+    [ -n "$selected" ] || die "no unrestored plan directory found under /root/root-encrypt-plan-*"
+  fi
+
+  count="$(list_unrestored_plan_dirs | wc -l | tr -d ' ')"
+  printf 'Detected unrestored prepare plans: %s\n' "$count"
+  if [ "$count" -gt 1 ]; then
+    printf 'Preselected latest plan: %s\n' "$selected"
+  fi
+  RESTORE_PLAN_DIR="$selected"
+}
+
+remove_created_paths_from_plan() {
+  local plan_dir="$1"
+  local created_file="${plan_dir}/created-paths.txt"
+  local path=""
+
+  [ -f "$created_file" ] || return 0
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    case "$path" in
+      /*)
+        [ -e "$path" ] || continue
+        rm -rf "$path"
+        ;;
+      *) ;;
+    esac
+  done <"$created_file"
+}
+
+restore_from_plan() {
+  local plan_dir="$1"
+  local restore_backup_dir="${plan_dir}/file-backups"
+
+  [ -d "$restore_backup_dir" ] || die "backup directory not found in plan: ${restore_backup_dir}"
+
+  confirm_or_abort "Restore files from ${plan_dir}? This will overwrite current files with saved originals"
+
+  cp -a "${restore_backup_dir}/." /
+  remove_created_paths_from_plan "$plan_dir"
+
+  detect_boot_layout
+  update-initramfs -u -k all
+  case "$BOOT_LAYOUT" in
+    proxmox-boot-tool-grub|proxmox-boot-tool-systemd-boot)
+      proxmox-boot-tool refresh
+      ;;
+    grub|grub-bios|unknown)
+      if command -v update-grub >/dev/null 2>&1; then
+        update-grub >/dev/null 2>&1
+      fi
+      ;;
+    systemd-boot)
+      ;;
+  esac
+
+  touch "${plan_dir}/.restored"
+  clear_active_state
+  printf 'Restore completed from plan: %s\n' "$plan_dir"
+}
+
 backup_file() {
   local src="$1"
   local rel_path=""
   local dest=""
   [ -n "$src" ] || return 0
-  [ -e "$src" ] || return 0
   case "$src" in
     /*) ;;
     *) return 0 ;;
   esac
+  if [ ! -e "$src" ]; then
+    mkdir -p "$WORKDIR"
+    touch "$CREATED_PATHS_FILE"
+    if ! grep -Fxq "$src" "$CREATED_PATHS_FILE" 2>/dev/null; then
+      printf '%s\n' "$src" >>"$CREATED_PATHS_FILE"
+    fi
+    return 0
+  fi
   rel_path="${src#/}"
   dest="${BACKUP_DIR}/${rel_path}"
   mkdir -p "$(dirname "$dest")"
@@ -250,6 +391,10 @@ create_backup_boot_entry() {
   local initrd_src=""
   local kernel_cmdline=""
   local boot_backup_dir="/boot/pve-root-encrypt-backup"
+  local begin_marker="# >>> pve-root-encrypt-backup-entry >>>"
+  local end_marker="# <<< pve-root-encrypt-backup-entry <<<"
+  local tmp_custom=""
+  local first_uuid=""
 
   kernel_ver="$(uname -r)"
   kernel_src="/boot/vmlinuz-${kernel_ver}"
@@ -271,11 +416,11 @@ create_backup_boot_entry() {
 
   backup_file "$GRUB_CUSTOM_FILE"
   mkdir -p "$(dirname "$GRUB_CUSTOM_FILE")"
-  [ -f "$GRUB_CUSTOM_FILE" ] || touch "$GRUB_CUSTOM_FILE"
+  if [ ! -f "$GRUB_CUSTOM_FILE" ]; then
+    touch "$GRUB_CUSTOM_FILE"
+  fi
+  chmod 0755 "$GRUB_CUSTOM_FILE"
 
-  local begin_marker="# >>> pve-root-encrypt-backup-entry >>>"
-  local end_marker="# <<< pve-root-encrypt-backup-entry <<<"
-  local tmp_custom=""
   tmp_custom="$(mktemp)"
   awk -v b="$begin_marker" -v e="$end_marker" '
     $0 == b {skip=1; next}
@@ -283,8 +428,45 @@ create_backup_boot_entry() {
     !skip {print}
   ' "$GRUB_CUSTOM_FILE" >"$tmp_custom"
   mv -f "$tmp_custom" "$GRUB_CUSTOM_FILE"
+  chmod 0755 "$GRUB_CUSTOM_FILE"
 
-  cat <<EOF >>"$GRUB_CUSTOM_FILE"
+  case "$BOOT_LAYOUT" in
+    proxmox-boot-tool-grub)
+      [ "${#ESP_UUIDS[@]}" -gt 0 ] || die "proxmox-boot-tool GRUB mode detected but no ESP UUIDs found"
+      first_uuid="${ESP_UUIDS[0]}"
+      ESP_BACKUP_KERNEL_REL="/pve-root-encrypt-backup/vmlinuz-${kernel_ver}-${TS}"
+      ESP_BACKUP_INITRD_REL="/pve-root-encrypt-backup/initrd.img-${kernel_ver}-${TS}"
+      sync_backup_payload_to_esps "$BACKUP_KERNEL_PATH" "$BACKUP_INITRD_PATH" "$ESP_BACKUP_KERNEL_REL" "$ESP_BACKUP_INITRD_REL"
+
+      cat <<EOF >>"$GRUB_CUSTOM_FILE"
+
+${begin_marker}
+menuentry 'Proxmox root-encrypt backup initrd (${TS})' {
+  insmod part_gpt
+  insmod fat
+  search --no-floppy --fs-uuid --set=root ${first_uuid}
+  linux ${ESP_BACKUP_KERNEL_REL} ${kernel_cmdline}
+  initrd ${ESP_BACKUP_INITRD_REL}
+}
+${end_marker}
+EOF
+      BOOT_ENTRY_STATUS="configured-proxmox-grub-esp"
+      ;;
+    proxmox-boot-tool-systemd-boot)
+      [ "${#ESP_UUIDS[@]}" -gt 0 ] || die "proxmox-boot-tool systemd-boot mode detected but no ESP UUIDs found"
+      ESP_BACKUP_KERNEL_REL="/EFI/proxmox/root-encrypt-backup-${TS}/vmlinuz-${kernel_ver}"
+      ESP_BACKUP_INITRD_REL="/EFI/proxmox/root-encrypt-backup-${TS}/initrd.img-${kernel_ver}"
+      SYSTEMD_BOOT_ENTRY_ID="proxmox-root-encrypt-backup-${TS}"
+      sync_backup_payload_to_esps "$BACKUP_KERNEL_PATH" "$BACKUP_INITRD_PATH" "$ESP_BACKUP_KERNEL_REL" "$ESP_BACKUP_INITRD_REL"
+      write_systemd_boot_entries_to_esps "$SYSTEMD_BOOT_ENTRY_ID" "Proxmox root-encrypt backup initrd (${TS})" "$kernel_ver" "$kernel_cmdline" "$ESP_BACKUP_KERNEL_REL" "$ESP_BACKUP_INITRD_REL"
+      BOOT_ENTRY_STATUS="configured-proxmox-systemd-boot-esp"
+      ;;
+    systemd-boot)
+      write_local_systemd_boot_entry "$BACKUP_KERNEL_PATH" "$BACKUP_INITRD_PATH" "$kernel_ver" "$kernel_cmdline"
+      BOOT_ENTRY_STATUS="configured-local-systemd-boot"
+      ;;
+    grub|grub-bios|unknown)
+      cat <<EOF >>"$GRUB_CUSTOM_FILE"
 
 ${begin_marker}
 menuentry 'Proxmox root-encrypt backup initrd (${TS})' {
@@ -293,13 +475,141 @@ menuentry 'Proxmox root-encrypt backup initrd (${TS})' {
 }
 ${end_marker}
 EOF
+      BOOT_ENTRY_STATUS="configured-40_custom"
+      ;;
+    *)
+      die "unsupported boot layout: ${BOOT_LAYOUT}"
+      ;;
+  esac
 
-  if ! command -v update-grub >/dev/null 2>&1; then
-    die "update-grub not found; cannot materialize static boot entry from ${GRUB_CUSTOM_FILE}"
+  chmod 0755 "$GRUB_CUSTOM_FILE"
+}
+
+detect_boot_layout() {
+  local pbt_status=""
+
+  BOOT_LAYOUT="unknown"
+  ESP_UUIDS=()
+
+  if [ -s /etc/kernel/proxmox-boot-uuids ] && command -v proxmox-boot-tool >/dev/null 2>&1; then
+    mapfile -t ESP_UUIDS < <(grep -E '^[A-Fa-f0-9-]+$' /etc/kernel/proxmox-boot-uuids)
+    pbt_status="$(proxmox-boot-tool status 2>/dev/null || true)"
+    if printf '%s' "$pbt_status" | grep -qi 'configured with:.*grub'; then
+      BOOT_LAYOUT="proxmox-boot-tool-grub"
+      return 0
+    fi
+    if printf '%s' "$pbt_status" | grep -qi 'configured with:.*systemd-boot'; then
+      BOOT_LAYOUT="proxmox-boot-tool-systemd-boot"
+      return 0
+    fi
+    BOOT_LAYOUT="proxmox-boot-tool-grub"
+    return 0
   fi
-  backup_file "/boot/grub/grub.cfg"
-  update-grub >/dev/null 2>&1 || die "update-grub failed while creating backup boot entry"
-  BOOT_ENTRY_STATUS="configured-40_custom"
+
+  if [ ! -d /sys/firmware/efi ]; then
+    BOOT_LAYOUT="grub-bios"
+    return 0
+  fi
+
+  if command -v efibootmgr >/dev/null 2>&1; then
+    pbt_status="$(efibootmgr -v 2>/dev/null || true)"
+    if printf '%s' "$pbt_status" | grep -qi 'systemd-bootx64\.efi'; then
+      BOOT_LAYOUT="systemd-boot"
+      return 0
+    fi
+    if printf '%s' "$pbt_status" | grep -qi 'grubx64\.efi\|shimx64\.efi'; then
+      BOOT_LAYOUT="grub"
+      return 0
+    fi
+  fi
+
+  if [ -d /boot/efi/loader/entries ] || [ -d /efi/loader/entries ]; then
+    BOOT_LAYOUT="systemd-boot"
+  else
+    BOOT_LAYOUT="grub"
+  fi
+}
+
+mount_esp_rw_by_uuid() {
+  local uuid="$1"
+  local mount_dir="$2"
+
+  mkdir -p "$mount_dir"
+  mountpoint -q "$mount_dir" && umount "$mount_dir" || true
+  mount -o rw "UUID=${uuid}" "$mount_dir"
+}
+
+sync_backup_payload_to_esps() {
+  local src_kernel="$1"
+  local src_initrd="$2"
+  local dst_kernel_rel="$3"
+  local dst_initrd_rel="$4"
+  local uuid=""
+  local mount_dir=""
+
+  for uuid in "${ESP_UUIDS[@]}"; do
+    mount_dir="/mnt/pve-root-encrypt-esp-${uuid}"
+    mount_esp_rw_by_uuid "$uuid" "$mount_dir"
+    mkdir -p "${mount_dir}$(dirname "$dst_kernel_rel")"
+    mkdir -p "${mount_dir}$(dirname "$dst_initrd_rel")"
+    cp -a "$src_kernel" "${mount_dir}${dst_kernel_rel}"
+    cp -a "$src_initrd" "${mount_dir}${dst_initrd_rel}"
+    umount "$mount_dir"
+  done
+}
+
+write_systemd_boot_entries_to_esps() {
+  local entry_id="$1"
+  local title="$2"
+  local version="$3"
+  local options="$4"
+  local linux_rel="$5"
+  local initrd_rel="$6"
+  local uuid=""
+  local mount_dir=""
+
+  for uuid in "${ESP_UUIDS[@]}"; do
+    mount_dir="/mnt/pve-root-encrypt-esp-${uuid}"
+    mount_esp_rw_by_uuid "$uuid" "$mount_dir"
+    mkdir -p "${mount_dir}/loader/entries"
+    cat <<EOF >"${mount_dir}/loader/entries/${entry_id}.conf"
+title   ${title}
+version ${version}
+options ${options}
+linux   ${linux_rel}
+initrd  ${initrd_rel}
+EOF
+    umount "$mount_dir"
+  done
+}
+
+write_local_systemd_boot_entry() {
+  local kernel_path="$1"
+  local initrd_path="$2"
+  local kernel_ver="$3"
+  local cmdline="$4"
+  local esp_root=""
+  local entry_id=""
+
+  if [ -d /boot/efi/loader/entries ]; then
+    esp_root="/boot/efi"
+  elif [ -d /efi/loader/entries ]; then
+    esp_root="/efi"
+  else
+    die "systemd-boot detected but unable to locate mounted ESP loader/entries"
+  fi
+
+  entry_id="proxmox-root-encrypt-backup-${TS}"
+  mkdir -p "${esp_root}/EFI/proxmox/root-encrypt-backup-${TS}"
+  cp -a "$kernel_path" "${esp_root}/EFI/proxmox/root-encrypt-backup-${TS}/vmlinuz-${kernel_ver}"
+  cp -a "$initrd_path" "${esp_root}/EFI/proxmox/root-encrypt-backup-${TS}/initrd.img-${kernel_ver}"
+  cat <<EOF >"${esp_root}/loader/entries/${entry_id}.conf"
+title   Proxmox root-encrypt backup initrd (${TS})
+version ${kernel_ver}
+options ${cmdline}
+linux   /EFI/proxmox/root-encrypt-backup-${TS}/vmlinuz-${kernel_ver}
+initrd  /EFI/proxmox/root-encrypt-backup-${TS}/initrd.img-${kernel_ver}
+EOF
 }
 
 write_checklist() {
@@ -315,10 +625,11 @@ Timestamp: ${TS}
 Unlock method: ${UNLOCK_METHOD}
 
 [x] Environment validation
+[x] Boot layout detected: ${BOOT_LAYOUT}
 [x] Snapshot prep: ${snapshot_status}
 [x] Modified file backups: ${BACKUP_COUNT}
 [x] Initramfs rebuilt: update-initramfs -u -k all
-[x] Proxmox boot refresh: proxmox-boot-tool refresh
+[x] Boot config refresh: ${BOOT_REFRESH_ACTION}
 [x] Backup initrd entry: ${BOOT_ENTRY_STATUS}
 
 USB details:
@@ -397,8 +708,29 @@ configure_dropbear_prereqs() {
 rebuild_initramfs_and_refresh_boot() {
   create_backup_boot_entry
   update-initramfs -u -k all
-  proxmox-boot-tool refresh
-  proxmox-boot-tool status >/dev/null 2>&1 || die "proxmox-boot-tool status failed after refresh"
+
+  case "$BOOT_LAYOUT" in
+    proxmox-boot-tool-grub|proxmox-boot-tool-systemd-boot)
+      proxmox-boot-tool refresh
+      proxmox-boot-tool status >/dev/null 2>&1 || die "proxmox-boot-tool status failed after refresh"
+      BOOT_REFRESH_ACTION="proxmox-boot-tool refresh"
+      ;;
+    grub|grub-bios|unknown)
+      if command -v update-grub >/dev/null 2>&1; then
+        backup_file "/boot/grub/grub.cfg"
+        update-grub >/dev/null 2>&1 || die "update-grub failed while creating backup boot entry"
+        BOOT_REFRESH_ACTION="update-grub"
+      else
+        BOOT_REFRESH_ACTION="none (update-grub not found)"
+      fi
+      ;;
+    systemd-boot)
+      BOOT_REFRESH_ACTION="none (entry written to mounted ESP loader/entries)"
+      ;;
+    *)
+      die "unsupported boot layout during refresh: ${BOOT_LAYOUT}"
+      ;;
+  esac
 }
 
 confirm_or_abort() {
@@ -428,14 +760,15 @@ validate_environment() {
   need_cmd findmnt
   need_cmd grep
   need_cmd head
+  need_cmd mount
   need_cmd mktemp
   need_cmd mkdir
   need_cmd pveversion
-  need_cmd proxmox-boot-tool
   need_cmd realpath
   need_cmd sed
   need_cmd stat
   need_cmd tail
+  need_cmd umount
   need_cmd uname
   need_cmd update-initramfs
   need_cmd zfs
@@ -463,14 +796,35 @@ validate_environment() {
       ;;
   esac
 
-  # Ensure proxmox-boot-tool is operational before any risky changes.
-  proxmox-boot-tool status >/dev/null 2>&1 || die "proxmox-boot-tool status failed"
+  detect_boot_layout
+
+  # On proxmox-boot-tool systems ensure the command is healthy before any risky changes.
+  if [ "$BOOT_LAYOUT" = "proxmox-boot-tool-grub" ] || [ "$BOOT_LAYOUT" = "proxmox-boot-tool-systemd-boot" ]; then
+    need_cmd proxmox-boot-tool
+    proxmox-boot-tool status >/dev/null 2>&1 || die "proxmox-boot-tool status failed"
+  fi
 
   case "$UNLOCK_METHOD" in
     usb|dropbear|both) ;;
     "") ;;
     *) die "invalid --unlock-method '${UNLOCK_METHOD}' (expected usb|dropbear|both)" ;;
   esac
+}
+
+validate_restore_environment() {
+  need_cmd awk
+  need_cmd cp
+  need_cmd find
+  need_cmd mount
+  need_cmd rm
+  need_cmd sort
+  need_cmd tail
+  need_cmd tr
+  need_cmd umount
+  need_cmd update-initramfs
+  need_cmd zfs
+  need_cmd zpool
+  [ "$(id -u)" -eq 0 ] || die "run as root"
 }
 
 create_snapshot() {
@@ -517,10 +871,12 @@ Dropbear conf:     ${DROPBEAR_CONF}
 Dropbear keys:     ${DROPBEAR_AUTH_KEYS}
 USB unlock hook:   ${USB_UNLOCK_HOOK}
 Backups dir:       ${BACKUP_DIR}
+Created paths:     ${CREATED_PATHS_FILE}
 Checklist file:    ${CHECKLIST_FILE}
 Backup kernel:     ${BACKUP_KERNEL_PATH:-<not-set>}
 Backup initrd:     ${BACKUP_INITRD_PATH:-<not-set>}
 Boot backup entry: ${BOOT_ENTRY_STATUS}
+State file:        ${STATE_FILE}
 
 Important:
 - Next step must run from initramfs shell (or equivalent rescue shell), not from
@@ -530,9 +886,12 @@ Important:
 Suggested offline command:
   bash tools/pve/encryption/apply-root-encryption-initramfs.sh "${PASS_FILE}" --snapshot "${SNAP_NAME}" --yes
 
+Restore command (if you want to revert prepare changes):
+  bash tools/pve/encryption/prepare-root-encryption.sh --restore "${WORKDIR}"
+
 Initramfs/boot actions completed by prepare script:
   update-initramfs -u -k all
-  proxmox-boot-tool refresh
+  ${BOOT_REFRESH_ACTION}
 
 Post-boot checks:
   zfs get encryption,encryptionroot,keystatus rpool/ROOT rpool/ROOT/pve-1
@@ -553,6 +912,7 @@ print_summary() {
     printf 'Snapshot:  %s\n' "$SNAP_FULL"
   fi
   printf 'Unlock method: %s\n' "$UNLOCK_METHOD"
+  printf 'Boot layout:   %s\n' "$BOOT_LAYOUT"
   printf 'Key UUID:      %s\n' "${USB_LOCATOR_VALUE:-<not-set>}"
   printf 'Key PARTUUID:  %s\n' "${USB_PARTUUID:-<not-set>}"
   printf 'Key mountpoint:%s\n' " ${KEY_MOUNT_POINT}"
@@ -560,10 +920,12 @@ print_summary() {
   printf 'Source device: %s\n' "${USB_SOURCE_DEVICE:-<not-set>}"
   printf 'Locator used:  %s=%s\n' "${USB_LOCATOR_TYPE:-<not-set>}" "${USB_LOCATOR_VALUE:-<not-set>}"
   printf 'File backups:  %s (files: %s)\n' "$BACKUP_DIR" "$BACKUP_COUNT"
+  printf 'Created paths: %s\n' "$CREATED_PATHS_FILE"
   printf 'Checklist:     %s\n' "$CHECKLIST_FILE"
   printf 'Backup kernel: %s\n' "${BACKUP_KERNEL_PATH:-<not-set>}"
   printf 'Backup initrd: %s\n' "${BACKUP_INITRD_PATH:-<not-set>}"
   printf 'Boot entry:    %s\n' "$BOOT_ENTRY_STATUS"
+  printf 'State file:    %s\n' "$STATE_FILE"
   if unlock_method_uses_dropbear; then
     printf 'Dropbear conf: %s\n' "$DROPBEAR_CONF"
     printf 'Dropbear keys: %s\n' "$DROPBEAR_AUTH_KEYS"
@@ -576,6 +938,15 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --yes) AUTO_YES=1; shift ;;
     --skip-snapshot) SKIP_SNAPSHOT=1; shift ;;
+    --restore)
+      RESTORE_MODE=1
+      if [ "$#" -ge 2 ] && [ "${2#--}" = "$2" ]; then
+        RESTORE_PLAN_DIR="$2"
+        shift 2
+      else
+        shift
+      fi
+      ;;
     --unlock-method)
       [ "$#" -ge 2 ] || die "--unlock-method requires a value"
       UNLOCK_METHOD="$2"
@@ -598,16 +969,27 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+if [ "$RESTORE_MODE" -eq 1 ]; then
+  [ -n "$PASS_FILE" ] && die "PASS_FILE must not be provided with --restore"
+  validate_restore_environment
+  resolve_restore_plan_dir
+  restore_from_plan "$RESTORE_PLAN_DIR"
+  exit 0
+fi
+
 [ -n "$PASS_FILE" ] || usage
 
 select_unlock_method_if_needed
 validate_environment
+ensure_prepare_not_already_active
 detect_usb_locator_from_passfile
 confirm_or_abort "Prepare root dataset encryption for ${SOURCE_ROOT}? This is a high-risk operation."
+init_workdir
 configure_usb_prereqs
 configure_dropbear_prereqs
 rebuild_initramfs_and_refresh_boot
 create_snapshot
 write_checklist
 write_plan
+write_active_state
 print_summary
