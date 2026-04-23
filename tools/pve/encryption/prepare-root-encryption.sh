@@ -966,13 +966,13 @@ print_summary() {
     printf 'Dropbear conf: %s\n' "$DROPBEAR_CONF"
     printf 'Dropbear keys: %s\n' "$DROPBEAR_AUTH_KEYS"
   fi
-  printf '\nProssimi passi:\n'
-  printf '-- Riavvia il sistema. L\'applicazione della cifratura verrà eseguita automaticamente in initramfs prima del mount di root.\n'
-  printf '-- In caso di errore o interruzione, apparirà un menu di recovery al boot per riprovare, ripristinare o aprire una shell.\n'
-  printf '-- Dopo il successo, il sistema avvierà normalmente.\n'
-  printf '\nPer annullare tutte le modifiche (restore):\n'
+  printf "\nProssimi passi:\n"
+  printf "%s\n" "-- Riavvia il sistema. L'applicazione della cifratura verrà eseguita automaticamente in initramfs prima del mount di root."
+  printf "%s\n" "-- In caso di errore o interruzione, apparirà un menu di recovery al boot per riprovare, ripristinare o aprire una shell."
+  printf "%s\n" "-- Dopo il successo, il sistema avvierà normalmente."
+  printf "\nPer annullare tutte le modifiche (restore):\n"
   printf '  bash tools/pve/encryption/prepare-root-encryption.sh --restore "%s"\n' "$WORKDIR"
-  printf '\nDopo il boot, controlla:\n'
+  printf "\nDopo il boot, controlla:\n"
   printf '  zfs get encryption,encryptionroot,keystatus rpool/ROOT rpool/ROOT/pve-1\n'
   printf '  zpool get bootfs rpool\n'
   printf '  proxmox-boot-tool status\n'
@@ -1071,6 +1071,11 @@ EOF
 }
 
 write_initramfs_auto_apply_hook() {
+  local key_locator_type="$USB_LOCATOR_TYPE"
+  local key_locator_value="$USB_LOCATOR_VALUE"
+  local key_partuuid="$USB_PARTUUID"
+  local key_fs_type="$USB_FS_TYPE"
+
   backup_file "$INITRAMFS_AUTO_APPLY_HOOK"
   mkdir -p "$(dirname "$INITRAMFS_AUTO_APPLY_HOOK")"
   cat <<EOF >"$INITRAMFS_AUTO_APPLY_HOOK"
@@ -1108,15 +1113,34 @@ PLAN_DIR=""
 ATTEMPTS=0
 LAST_ERROR=""
 BOOT_LAYOUT=""
+KEY_LOCATOR_TYPE="${key_locator_type}"
+KEY_LOCATOR_VALUE="${key_locator_value}"
+KEY_PARTUUID="${key_partuuid}"
+KEY_FS_TYPE="${key_fs_type}"
 
-msg() { echo "[pve-encrypt-apply] \$*"; }
+msg() {
+  echo "[pve-encrypt-apply] \$*"
+  printf '%s\n' "[pve-encrypt-apply] \$*" >>"\$TMP_LOG" 2>/dev/null || true
+}
+
+
+is_mounted() {
+  # Prefer the mountpoint utility if present; otherwise check /proc/mounts.
+  if command -v mountpoint >/dev/null 2>&1; then
+    mountpoint -q "\$1"
+    return \$?
+  fi
+  grep -q " \$1 " /proc/mounts 2>/dev/null
+}
 
 mount_state_esp_rw() {
   local uuid=""
   mkdir -p "\$ESP_MNT"
   for uuid in \$ESP_UUIDS; do
     [ -b "/dev/disk/by-uuid/\$uuid" ] || continue
-    mountpoint -q "\$ESP_MNT" && umount "\$ESP_MNT" >/dev/null 2>&1 || true
+    if is_mounted "\$ESP_MNT"; then
+      umount "\$ESP_MNT" >/dev/null 2>&1 || true
+    fi
     if mount -o rw "/dev/disk/by-uuid/\$uuid" "\$ESP_MNT" >/dev/null 2>&1; then
       return 0
     fi
@@ -1124,7 +1148,176 @@ mount_state_esp_rw() {
   return 1
 }
 
-umount_state_esp() { mountpoint -q "\$ESP_MNT" && umount "\$ESP_MNT" >/dev/null 2>&1 || true; }
+umount_state_esp() { is_mounted "\$ESP_MNT" && umount "\$ESP_MNT" >/dev/null 2>&1 || true; }
+
+restore_tmp_log_from_esp_if_needed() {
+  # On subsequent boots in failed/running states, keep the previous attempt log
+  # available in /tmp so the recovery menu can show real diagnostics.
+  if [ ! -s "\$TMP_LOG" ] && [ -f "\$ESP_MNT\$LOG_REL" ]; then
+    cp -a "\$ESP_MNT\$LOG_REL" "\$TMP_LOG" >/dev/null 2>&1 || true
+  fi
+}
+
+load_usb_modules() {
+  local module=""
+
+  for module in usb-storage uas sd_mod scsi_mod; do
+    modprobe "\$module" >/dev/null 2>&1 || true
+  done
+
+  [ -n "\$KEY_FS_TYPE" ] && modprobe "\$KEY_FS_TYPE" >/dev/null 2>&1 || true
+}
+
+resolve_key_device() {
+  local dev="" uuid="" partuuid=""
+
+  if [ -n "\$KEY_LOCATOR_VALUE" ] && [ -b "/dev/disk/by-uuid/\$KEY_LOCATOR_VALUE" ]; then
+    printf '%s\n' "/dev/disk/by-uuid/\$KEY_LOCATOR_VALUE"
+    return 0
+  fi
+
+  if [ -n "\$KEY_PARTUUID" ] && [ -b "/dev/disk/by-partuuid/\$KEY_PARTUUID" ]; then
+    printf '%s\n' "/dev/disk/by-partuuid/\$KEY_PARTUUID"
+    return 0
+  fi
+
+  if command -v blkid >/dev/null 2>&1; then
+    for dev in /dev/sd* /dev/vd* /dev/nvme*n*p* /dev/mmcblk*p*; do
+      [ -b "\$dev" ] || continue
+      uuid="\$(blkid -s UUID -o value "\$dev" 2>/dev/null || true)"
+      partuuid="\$(blkid -s PARTUUID -o value "\$dev" 2>/dev/null || true)"
+      if [ -n "\$KEY_LOCATOR_VALUE" ] && [ "\$uuid" = "\$KEY_LOCATOR_VALUE" ]; then
+        printf '%s\n' "\$dev"
+        return 0
+      fi
+      if [ -n "\$KEY_PARTUUID" ] && [ "\$partuuid" = "\$KEY_PARTUUID" ]; then
+        printf '%s\n' "\$dev"
+        return 0
+      fi
+    done
+  fi
+
+  return 1
+}
+
+probe_key_device_by_mount() {
+  local dev="" pass_dir=""
+
+  pass_dir="\$(dirname "\$PASS_FILE")"
+  mkdir -p "\$pass_dir"
+
+  for dev in /dev/sd[a-z][0-9]* /dev/vd[a-z][0-9]* /dev/nvme*n*p* /dev/mmcblk*p*; do
+    [ -b "\$dev" ] || continue
+
+    if is_mounted "\$pass_dir"; then
+      umount "\$pass_dir" >/dev/null 2>&1 || true
+    fi
+
+    if mount -o ro "\$dev" "\$pass_dir" >/dev/null 2>&1; then
+      :
+    elif [ -n "\$KEY_FS_TYPE" ] && mount -t "\$KEY_FS_TYPE" -o ro "\$dev" "\$pass_dir" >/dev/null 2>&1; then
+      :
+    else
+      continue
+    fi
+
+    if [ -f "\$PASS_FILE" ]; then
+      printf '%s\n' "\$dev"
+      return 0
+    fi
+
+    umount "\$pass_dir" >/dev/null 2>&1 || true
+  done
+
+  return 1
+}
+
+log_key_device_diagnostics() {
+  msg "USB key diagnostics: PASS_FILE=\$PASS_FILE FS=\$KEY_FS_TYPE UUID=\$KEY_LOCATOR_VALUE PARTUUID=\$KEY_PARTUUID"
+  if [ -d /dev/disk/by-uuid ]; then
+    msg "Available /dev/disk/by-uuid entries:"
+    ls -1 /dev/disk/by-uuid >>"\$TMP_LOG" 2>/dev/null || true
+  fi
+  if [ -d /dev/disk/by-partuuid ]; then
+    msg "Available /dev/disk/by-partuuid entries:"
+    ls -1 /dev/disk/by-partuuid >>"\$TMP_LOG" 2>/dev/null || true
+  fi
+  if command -v blkid >/dev/null 2>&1; then
+    msg "blkid snapshot:"
+    blkid >>"\$TMP_LOG" 2>/dev/null || true
+  fi
+}
+
+wait_for_passfile() {
+  local attempt=1 max_attempts=30
+
+  while [ "\$attempt" -le "\$max_attempts" ]; do
+    [ -f "\$PASS_FILE" ] && return 0
+
+    load_usb_modules
+
+    if ensure_passfile_available_once; then
+      return 0
+    fi
+
+    if [ "\$attempt" -eq 1 ] || [ \$((attempt % 5)) -eq 0 ]; then
+      msg "USB key not ready yet (attempt \$attempt/\$max_attempts)"
+    fi
+
+    sleep 1
+    attempt=\$((attempt + 1))
+  done
+
+  log_key_device_diagnostics
+  return 1
+}
+
+ensure_passfile_available_once() {
+  local pass_dir="" key_dev=""
+
+  [ -n "\$PASS_FILE" ] || return 1
+  [ -f "\$PASS_FILE" ] && return 0
+
+  pass_dir="\$(dirname "\$PASS_FILE")"
+  mkdir -p "\$pass_dir"
+
+  key_dev="\$(resolve_key_device 2>/dev/null || true)"
+  if [ -z "\$key_dev" ]; then
+    msg "Unable to resolve USB key device by UUID/PARTUUID (UUID=\$KEY_LOCATOR_VALUE PARTUUID=\$KEY_PARTUUID). Trying mount-probe fallback..."
+    key_dev="\$(probe_key_device_by_mount 2>/dev/null || true)"
+    [ -n "\$key_dev" ] || return 1
+    msg "Mount-probe fallback found candidate device: \$key_dev"
+    return 0
+  fi
+
+  if is_mounted "\$pass_dir"; then
+    umount "\$pass_dir" >/dev/null 2>&1 || true
+  fi
+
+  if mount -o ro "\$key_dev" "\$pass_dir" >/dev/null 2>&1; then
+    :
+  elif [ -n "\$KEY_FS_TYPE" ] && mount -t "\$KEY_FS_TYPE" -o ro "\$key_dev" "\$pass_dir" >/dev/null 2>&1; then
+    :
+  else
+    msg "Failed mounting USB device \$key_dev on \$pass_dir"
+    return 1
+  fi
+
+  if [ -f "\$PASS_FILE" ]; then
+    msg "Mounted \$key_dev on \$pass_dir and found PASS_FILE"
+    return 0
+  fi
+
+  msg "Mounted \$key_dev on \$pass_dir but PASS_FILE still missing: \$PASS_FILE"
+  return 1
+}
+
+ensure_passfile_available() {
+  [ -n "\$PASS_FILE" ] || return 1
+  [ -f "\$PASS_FILE" ] && return 0
+
+  wait_for_passfile
+}
 
 load_state() {
   local file="\$ESP_MNT\$STATE_REL"
@@ -1153,7 +1346,7 @@ write_state() {
   local new_error="\${2:-}"
   local attempts="\$ATTEMPTS"
   [ "\$new_state" = "running" ] && attempts=\$((attempts + 1))
-  mkdir -p "\$ESP_MNT$(dirname "\$STATE_REL")"
+  mkdir -p "\$ESP_MNT\$(dirname "\$STATE_REL")"
   cat <<STATEEOF >"\$ESP_MNT\$STATE_REL"
 state=\$new_state
 pool=\$POOL
@@ -1176,37 +1369,52 @@ STATEEOF
 }
 
 flush_log() {
-  mkdir -p "\$ESP_MNT$(dirname "\$LOG_REL")"
+  mkdir -p "\$ESP_MNT\$(dirname "\$LOG_REL")"
   [ -f "\$TMP_LOG" ] && cp -a "\$TMP_LOG" "\$ESP_MNT\$LOG_REL"
 }
 
 open_recovery_menu() {
-  local choice=""
+  local choice="" rc_file="/tmp/.pve_recovery_rc"
   msg "Apply state=\$STATE (error=\$LAST_ERROR)."
+  msg "Log: \$TMP_LOG  (also on ESP: \$LOG_REL)"
   while :; do
     echo ""
     echo "pve-encrypt recovery menu"
     echo "1) Attempt ROOT restore from copy/snapshot"
-    echo "2) Open emergency shell"
-    echo "3) Reboot"
-    printf "Choice [1-3]: "
+    echo "2) Show apply log"
+    echo "3) Open emergency shell"
+    echo "4) Reboot"
+    printf "Choice [1-4]: "
     read -r choice
     case "\$choice" in
       1)
-        if "\$APPLY_SCRIPT" "\$PASS_FILE" --snapshot "\$SNAPSHOT" --yes --recover-root >"\$TMP_LOG" 2>&1; then
+        msg "Starting recovery - output visible on screen and logged..."
+        rm -f "\$rc_file"
+        # Run with tee so output appears on screen AND goes to log.
+        # Exit code is captured in a temp file because POSIX sh pipeline
+        # exits with the exit code of the last command (tee), not apply.
+        { "\$APPLY_SCRIPT" "\$PASS_FILE" --snapshot "\$SNAPSHOT" --yes --recover-root; printf '%d' "\$?" >"\$rc_file"; } 2>&1 | tee -a "\$TMP_LOG"
+        if [ "\$(cat "\$rc_file" 2>/dev/null)" = "0" ]; then
           write_state "recovered" ""
           flush_log
           umount_state_esp
+          msg "Recovery succeeded. Rebooting..."
           reboot -f
           echo b > /proc/sysrq-trigger
         else
           write_state "failed" "recovery_failed"
           flush_log
+          msg "Recovery FAILED. Opening emergency shell."
           /bin/sh
         fi
         ;;
-      2) /bin/sh ;;
-      3)
+      2)
+        echo "--- LOG START ---"
+        cat "\$TMP_LOG" 2>/dev/null || echo "(log empty)"
+        echo "--- LOG END ---"
+        ;;
+      3) /bin/sh ;;
+      4)
         umount_state_esp
         reboot -f
         echo b > /proc/sysrq-trigger
@@ -1220,6 +1428,7 @@ open_recovery_menu() {
 touch "\$LOCK_FILE"
 mount_state_esp_rw || exit 0
 load_state || { umount_state_esp; exit 0; }
+restore_tmp_log_from_esp_if_needed
 
 case "\$STATE" in
   completed|recovered) umount_state_esp; exit 0 ;;
@@ -1242,11 +1451,27 @@ if [ ! -x "\$APPLY_SCRIPT" ]; then
   open_recovery_menu
 fi
 
+if ! ensure_passfile_available; then
+  write_state "failed" "pass_file_missing"
+  flush_log
+  open_recovery_menu
+fi
+
 write_state "running" ""
-if "\$APPLY_SCRIPT" "\$PASS_FILE" --snapshot "\$SNAPSHOT" --yes >"\$TMP_LOG" 2>&1; then
+_apply_rc_file="/tmp/.pve_apply_rc"
+rm -f "\$_apply_rc_file"
+# Fresh apply attempt: start a new per-attempt log file.
+rm -f "\$TMP_LOG"
+: >"\$TMP_LOG"
+# Run apply with tee so output is visible on screen AND logged.
+# Exit code is written to a temp file because a POSIX sh pipeline
+# returns the exit of the last process (tee), not the apply script.
+{ "\$APPLY_SCRIPT" "\$PASS_FILE" --snapshot "\$SNAPSHOT" --yes; printf '%d' "\$?" >"\$_apply_rc_file"; } 2>&1 | tee -a "\$TMP_LOG"
+if [ "\$(cat "\$_apply_rc_file" 2>/dev/null)" = "0" ]; then
   write_state "completed" ""
   flush_log
   umount_state_esp
+  msg "Apply succeeded. Rebooting..."
   reboot -f
   echo b > /proc/sysrq-trigger
 else

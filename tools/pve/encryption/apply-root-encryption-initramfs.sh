@@ -1,21 +1,15 @@
-#!/usr/bin/env bash
-set -Eeuo pipefail
+#!/bin/sh
+# Run in a minimal initramfs (BusyBox ash) - keep options portable
+set -eu
 
 # apply-root-encryption-initramfs.sh
 #
 # Offline helper meant to be run from initramfs/rescue shell to encrypt
 # rpool/ROOT while rootfs is not mounted.
 #
-# High-level flow:
-# 1) import pool and validate source layout
-# 2) clone unencrypted ROOT into a temporary dataset
-# 3) destroy unencrypted rpool/ROOT
-# 4) create encrypted rpool/ROOT
-# 5) copy children from temporary dataset back into encrypted ROOT
-# 6) set rpool bootfs and print verification commands
-#
 # Usage:
 #   ./apply-root-encryption-initramfs.sh <PASS_FILE> [--snapshot <name>] [--yes] [--keep-copy]
+#   ./apply-root-encryption-initramfs.sh [<PASS_FILE>] [--snapshot <name>] --recover-root [--yes]
 
 PASS_FILE=""
 AUTO_YES=0
@@ -30,8 +24,42 @@ ROOT_CHILD_EXPECTED="pve-1"
 TS="$(date +%Y%m%d-%H%M%S)"
 COPY_SNAP="reenc-${TS}"
 
+# ---------------------------------------------------------------------------
+# Verbose logging helpers
+# _con: write to /dev/console DIRECTLY so messages are ALWAYS visible on
+# screen even when stdout/stderr is redirected to a log file by the hook.
+# ---------------------------------------------------------------------------
+_ts() { date '+%H:%M:%S' 2>/dev/null || printf '??:??:??'; }
+
+_con() {
+  printf '[%s] %s\n' "$(_ts)" "$*"
+  printf '[%s] %s\n' "$(_ts)" "$*" >/dev/console 2>/dev/null || true
+}
+
+_step() {
+  local n="$1" total="$2" desc="$3"
+  printf '\n============================================================\n'
+  printf '  STEP %s/%s: %s\n' "$n" "$total" "$desc"
+  printf '============================================================\n'
+  printf '\n[%s] STEP %s/%s: %s\n' "$(_ts)" "$n" "$total" "$desc" >/dev/console 2>/dev/null || true
+}
+
+_ok() {
+  printf '[OK]  %s\n' "$*"
+  printf '[OK]  %s\n' "$*" >/dev/console 2>/dev/null || true
+}
+
+_err() {
+  printf '[ERR] %s\n' "$*" >&2
+  printf '[ERR] %s\n' "$*" >/dev/console 2>/dev/null || true
+}
+
+_ds_size() {
+  zfs get -H -o value used "$1" 2>/dev/null || printf 'unknown'
+}
+
 die() {
-  printf 'ERROR: %s\n' "$*" >&2
+  _err "FATAL: $*"
   exit 1
 }
 
@@ -48,71 +76,161 @@ Usage:
 Options:
   --snapshot NAME      source snapshot name on rpool/ROOT (without dataset prefix)
   --yes                non-interactive confirmation
-  --keep-copy          keep temporary dataset rpool/root-unencrypted-copy for manual rollback
+  --keep-copy          keep temp dataset rpool/root-unencrypted-copy for manual rollback
   --recover-root       restore unencrypted rpool/ROOT from temporary copy or snapshot
-
-PASS_FILE requirements:
-  - full path under /mnt/<first-level-dir>/<file>
-  - example: /mnt/_USB_PENDRIVE_KEY/miapasswordzfs.txt
-  - when running from initramfs shell, ensure USB is mounted and PASS_FILE exists
 EOF
   exit 1
 }
 
-import_pool_for_recovery() {
-  if zpool list -H "$POOL" >/dev/null 2>&1; then
-    return 0
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+diagnostic_checks() {
+  _con "=== pve-encrypt diagnostics ==="
+  _con "PASS_FILE: ${PASS_FILE:-<not-set>}"
+
+  if [ -n "${PASS_FILE:-}" ]; then
+    if [ -f "$PASS_FILE" ]; then
+      _con "PASS_FILE: present ($(wc -c <"$PASS_FILE" 2>/dev/null || echo '?') bytes)"
+    else
+      _con "PASS_FILE: *** MISSING ***"
+    fi
   fi
-  modprobe zfs >/dev/null 2>&1 || true
-  zpool import -N -f "$POOL"
+
+  printf '\nUtility availability:\n'
+  for cmd in zfs zpool modprobe awk sed grep mount umount blkid realpath; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      printf '  %-12s OK\n' "$cmd"
+    else
+      printf '  %-12s *** MISSING ***\n' "$cmd"
+    fi
+  done
+
+  printf '\nZFS pool status:\n'
+  if command -v zpool >/dev/null 2>&1; then
+    zpool list 2>/dev/null || printf '  (zpool list failed)\n'
+  else
+    printf '  zpool: not available\n'
+  fi
+
+  printf '\nZFS datasets (first 20):\n'
+  if command -v zfs >/dev/null 2>&1; then
+    zfs list -H -o name,used,avail,encryption 2>/dev/null | head -n 20 || printf '  (zfs list failed)\n'
+  else
+    printf '  zfs: not available\n'
+  fi
+
+  printf '\n/proc/mounts (first 30):\n'
+  sed -n '1,30p' /proc/mounts 2>/dev/null || true
+
+  _con "=== end diagnostics ==="
 }
 
-restore_root_from_copy_or_snapshot() {
-  local child=""
-  local child_name=""
-  local target=""
-  local restore_src=""
-  local restore_copy="${POOL}/root-recovery-copy"
-  local rec_snap="recover-${TS}"
+# ---------------------------------------------------------------------------
+# Pool import
+# ---------------------------------------------------------------------------
+import_pool_if_needed() {
+  _con "Checking pool ${POOL}..."
+  if zpool list -H "$POOL" >/dev/null 2>&1; then
+    _ok "Pool ${POOL} already imported"
+    return 0
+  fi
+  _con "Pool not imported - loading zfs module..."
+  modprobe zfs >/dev/null 2>&1 || true
+  _con "Running: zpool import -N -f ${POOL}"
+  if zpool import -N -f "$POOL"; then
+    _ok "Pool ${POOL} imported"
+  else
+    die "zpool import failed for ${POOL}"
+  fi
+}
 
-  import_pool_for_recovery
+# ---------------------------------------------------------------------------
+# Recovery
+# ---------------------------------------------------------------------------
+restore_root_from_copy_or_snapshot() {
+  local child="" child_name="" target=""
+  local restore_src="" restore_copy="${POOL}/root-recovery-copy"
+  local rec_snap="recover-${TS}"
+  local size="" n=0 child_count=0
+
+  _step 1 4 "Import pool and locate restore source"
+  import_pool_if_needed
 
   if zfs list -H "$TEMP_ROOT" >/dev/null 2>&1; then
+    size=$(_ds_size "$TEMP_ROOT")
+    _ok "Temporary copy found: ${TEMP_ROOT} (used: ${size})"
     restore_src="$TEMP_ROOT"
   else
+    _con "No temporary copy found - falling back to snapshot"
     [ -n "$SNAPSHOT_NAME" ] || detect_snapshot_if_missing
     zfs list -H "${SOURCE_ROOT}@${SNAPSHOT_NAME}" >/dev/null 2>&1 || \
       die "snapshot not found for recovery: ${SOURCE_ROOT}@${SNAPSHOT_NAME}"
-    zfs list -H "$restore_copy" >/dev/null 2>&1 && zfs destroy -r "$restore_copy" >/dev/null 2>&1 || true
-    zfs send -R "${SOURCE_ROOT}@${SNAPSHOT_NAME}" | zfs recv -u -F "$restore_copy"
+    size=$(_ds_size "${SOURCE_ROOT}@${SNAPSHOT_NAME}")
+    _con "Snapshot: ${SOURCE_ROOT}@${SNAPSHOT_NAME} (size: ${size})"
+
+    if zfs list -H "$restore_copy" >/dev/null 2>&1; then
+      _con "Removing stale recovery copy: ${restore_copy}"
+      zfs destroy -r "$restore_copy"
+    fi
+    _step 2 4 "Clone snapshot into recovery copy (size: ${size}) - may take minutes"
+    _con "Running: zfs send -v -R | zfs recv  -- please wait..."
+    zfs send -v -R "${SOURCE_ROOT}@${SNAPSHOT_NAME}" 2>/dev/console | zfs recv -u -F "$restore_copy"
+    _ok "Recovery copy created: ${restore_copy}"
     restore_src="$restore_copy"
   fi
 
+  _step 2 4 "Snapshot restore source"
+  _con "Creating: ${restore_src}@${rec_snap}"
   zfs snapshot -r "${restore_src}@${rec_snap}"
+  _ok "Snapshot created"
 
-  zfs list -H "$SOURCE_ROOT" >/dev/null 2>&1 && zfs destroy -r "$SOURCE_ROOT" || true
+  _step 3 4 "Recreate unencrypted ${SOURCE_ROOT}"
+  if zfs list -H "$SOURCE_ROOT" >/dev/null 2>&1; then
+    _con "Destroying existing ${SOURCE_ROOT}..."
+    zfs destroy -r "$SOURCE_ROOT"
+    _ok "${SOURCE_ROOT} destroyed"
+  fi
+  _con "Creating ${SOURCE_ROOT} (unencrypted, mountpoint=/rpool/ROOT, canmount=off)"
   zfs create -o mountpoint="/rpool/ROOT" -o canmount=off "$SOURCE_ROOT"
+  _ok "${SOURCE_ROOT} created"
 
-  while IFS= read -r child; do
+  _step 4 4 "Restore children into ${SOURCE_ROOT}"
+  child_count=$(zfs list -H -r -d 1 -o name "$restore_src" | grep -c "." || true)
+  _con "Datasets to restore: ~${child_count}"
+
+  zfs list -H -r -d 1 -o name "$restore_src" | while IFS= read -r child; do
     [ -n "$child" ] || continue
     [ "$child" = "$restore_src" ] && continue
+    n=$((n + 1))
     child_name="${child##*/}"
     target="${SOURCE_ROOT}/${child_name}"
-    zfs send -R "${child}@${rec_snap}" | zfs recv -u -F "$target"
-  done < <(zfs list -H -r -d 1 -o name "$restore_src")
+    size=$(_ds_size "${child}@${rec_snap}")
+    _con "  [${n}] Restoring ${child_name} (${size}) -> ${target}  please wait..."
+    zfs send -v -R "${child}@${rec_snap}" 2>/dev/console | zfs recv -u -F "$target"
+    _ok "  [${n}] ${child_name} restored"
+  done
 
+  _con "Verifying boot dataset: ${SOURCE_ROOT}/${ROOT_CHILD_EXPECTED}"
   zfs list -H "${SOURCE_ROOT}/${ROOT_CHILD_EXPECTED}" >/dev/null 2>&1 || \
     die "expected boot dataset missing after recovery: ${SOURCE_ROOT}/${ROOT_CHILD_EXPECTED}"
-  zpool set bootfs="${SOURCE_ROOT}/${ROOT_CHILD_EXPECTED}" "$POOL"
+  _ok "Boot dataset present"
 
-  [ "$restore_src" = "$restore_copy" ] && zfs destroy -r "$restore_copy" >/dev/null 2>&1 || true
+  _con "Setting: zpool set bootfs=${SOURCE_ROOT}/${ROOT_CHILD_EXPECTED} ${POOL}"
+  zpool set bootfs="${SOURCE_ROOT}/${ROOT_CHILD_EXPECTED}" "$POOL"
+  _ok "bootfs set -> ${SOURCE_ROOT}/${ROOT_CHILD_EXPECTED}"
+
+  if [ "$restore_src" = "$restore_copy" ]; then
+    _con "Cleaning up recovery copy: ${restore_copy}"
+    zfs destroy -r "$restore_copy" >/dev/null 2>&1 || true
+  fi
 }
 
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
 validate_passfile_layout() {
-  local pass_real="$1"
-  local rel=""
-  local remainder=""
-
+  local pass_real="$1" rel="" remainder=""
   case "$pass_real" in
     /mnt/*/*) ;;
     *) die "PASS_FILE must be under /mnt/<dir>/<file>: ${pass_real}" ;;
@@ -127,9 +245,9 @@ validate_passfile_layout() {
 }
 
 confirm_or_abort() {
-  local prompt="$1"
-  local answer=""
+  local prompt="$1" answer=""
   if [ "$AUTO_YES" -eq 1 ]; then
+    _con "Auto-confirmed: ${prompt}"
     return 0
   fi
   if [ ! -t 0 ]; then
@@ -143,62 +261,80 @@ confirm_or_abort() {
   esac
 }
 
-import_pool_if_needed() {
-  if zpool list -H "$POOL" >/dev/null 2>&1; then
-    return 0
-  fi
-  modprobe zfs >/dev/null 2>&1 || true
-  zpool import -N -f "$POOL"
-}
-
 detect_snapshot_if_missing() {
-  if [ -n "$SNAPSHOT_NAME" ]; then
-    return 0
-  fi
+  [ -n "$SNAPSHOT_NAME" ] && return 0
+  _con "Auto-detecting latest pre-root-encrypt snapshot..."
   SNAPSHOT_NAME="$(zfs list -H -t snapshot -o name -s creation \
     | awk -v d="${SOURCE_ROOT}@" '$1 ~ "^" d "pre-root-encrypt-" {name=$1} END {sub(/^.*@/, "", name); print name}')"
-  [ -n "$SNAPSHOT_NAME" ] || die "no snapshot detected; pass --snapshot <name>"
+  [ -n "$SNAPSHOT_NAME" ] || die "no pre-root-encrypt snapshot found; pass --snapshot <name>"
+  _ok "Detected snapshot: ${SOURCE_ROOT}@${SNAPSHOT_NAME}"
 }
 
 validate_preflight() {
+  _step 0 6 "Pre-flight checks"
+
+  _con "Checking required commands..."
   need_cmd awk
   need_cmd modprobe
   need_cmd zfs
   need_cmd zpool
-  need_cmd realpath
+  _ok "Required commands present"
 
   [ "$(id -u)" -eq 0 ] || die "run as root"
-  validate_passfile_layout "$(realpath "$PASS_FILE" 2>/dev/null || printf '%s' "$PASS_FILE")"
+
+  if command -v realpath >/dev/null 2>&1; then
+    validate_passfile_layout "$(realpath "$PASS_FILE" 2>/dev/null || printf '%s' "$PASS_FILE")"
+  else
+    validate_passfile_layout "$PASS_FILE"
+  fi
   [ -f "$PASS_FILE" ] || die "passphrase file not found: $PASS_FILE"
   [ -s "$PASS_FILE" ] || die "passphrase file is empty: $PASS_FILE"
-  chmod 600 "$PASS_FILE"
+  [ -r "$PASS_FILE" ] || die "passphrase file is not readable: $PASS_FILE"
+  _ok "Passphrase file valid: ${PASS_FILE}"
 
   import_pool_if_needed
+
   zfs list -H "$SOURCE_ROOT" >/dev/null 2>&1 || die "missing source dataset: $SOURCE_ROOT"
+  _ok "Source dataset present: ${SOURCE_ROOT}"
 
   detect_snapshot_if_missing
   zfs list -H "${SOURCE_ROOT}@${SNAPSHOT_NAME}" >/dev/null 2>&1 || \
     die "snapshot not found: ${SOURCE_ROOT}@${SNAPSHOT_NAME}"
+  _ok "Snapshot found: ${SOURCE_ROOT}@${SNAPSHOT_NAME}"
 
   if zfs list -H "$TEMP_ROOT" >/dev/null 2>&1; then
-    die "temporary dataset already exists: $TEMP_ROOT (destroy it first)"
+    die "temporary dataset already exists: $TEMP_ROOT (destroy it first, or system is in a bad partial state)"
   fi
 
   local enc
   enc="$(zfs get -H -o value encryption "$SOURCE_ROOT")"
+  _con "Encryption status of ${SOURCE_ROOT}: ${enc}"
   [ "$enc" = "off" ] || die "${SOURCE_ROOT} already encrypted (encryption=${enc})"
+  _ok "Pre-flight checks passed"
 }
 
+# ---------------------------------------------------------------------------
+# Apply steps
+# ---------------------------------------------------------------------------
 clone_unencrypted_root() {
-  printf 'Cloning %s@%s into %s\n' "$SOURCE_ROOT" "$SNAPSHOT_NAME" "$TEMP_ROOT"
-  zfs send -R "${SOURCE_ROOT}@${SNAPSHOT_NAME}" | zfs recv -u -F "$TEMP_ROOT"
+  local size
+  size=$(_ds_size "${SOURCE_ROOT}@${SNAPSHOT_NAME}")
+  _step 1 6 "Clone unencrypted ROOT to temp dataset"
+  _con "Source: ${SOURCE_ROOT}@${SNAPSHOT_NAME}  size: ${size}"
+  _con "Target: ${TEMP_ROOT}"
+  _con "Running: zfs send -v -R | zfs recv  -- this may take several minutes..."
+  zfs send -v -R "${SOURCE_ROOT}@${SNAPSHOT_NAME}" 2>/dev/console | zfs recv -u -F "$TEMP_ROOT"
+  _ok "Clone completed: ${TEMP_ROOT} (used: $(zfs get -H -o value used "$TEMP_ROOT" 2>/dev/null || echo '?'))"
 }
 
 create_encrypted_root() {
-  printf 'Destroying unencrypted %s\n' "$SOURCE_ROOT"
+  _step 2 6 "Destroy unencrypted ${SOURCE_ROOT}"
+  _con "NOTE: ${TEMP_ROOT} is the safety copy for rollback"
   zfs destroy -r "$SOURCE_ROOT"
+  _ok "${SOURCE_ROOT} destroyed"
 
-  printf 'Creating encrypted %s\n' "$SOURCE_ROOT"
+  _step 3 6 "Create encrypted ${SOURCE_ROOT}"
+  _con "Encryption: aes-256-gcm  keyformat: passphrase"
   zfs create \
     -o encryption=aes-256-gcm \
     -o keyformat=passphrase \
@@ -206,69 +342,92 @@ create_encrypted_root() {
     -o mountpoint="/rpool/ROOT" \
     -o canmount=off \
     "$SOURCE_ROOT"
+  _ok "${SOURCE_ROOT} created (encrypted)"
 
-  if [ -f "$PASS_FILE" ]; then
-    zfs load-key -L "file://${PASS_FILE}" "$SOURCE_ROOT" >/dev/null 2>&1 || true
+  _con "Loading encryption key from: ${PASS_FILE}"
+  if zfs load-key -L "file://${PASS_FILE}" "$SOURCE_ROOT"; then
+    _ok "Encryption key loaded"
+  else
+    _con "WARNING: zfs load-key returned non-zero (continuing)"
   fi
 }
 
 restore_children_into_encrypted_root() {
-  local child=""
-  local child_name=""
-  local target=""
+  local child="" child_name="" target="" size="" n=0
 
-  printf 'Creating recursive snapshot on copy dataset: %s@%s\n' "$TEMP_ROOT" "$COPY_SNAP"
+  _step 4 6 "Snapshot temp copy and restore children into encrypted ROOT"
+  _con "Creating snapshot: ${TEMP_ROOT}@${COPY_SNAP}"
   zfs snapshot -r "${TEMP_ROOT}@${COPY_SNAP}"
+  _ok "Snapshot created"
 
-  while IFS= read -r child; do
+  zfs list -H -r -d 1 -o name "$TEMP_ROOT" | while IFS= read -r child; do
     [ -n "$child" ] || continue
     [ "$child" = "$TEMP_ROOT" ] && continue
+    n=$((n + 1))
     child_name="${child##*/}"
     target="${SOURCE_ROOT}/${child_name}"
-    printf 'Restoring child %s -> %s\n' "$child" "$target"
-    zfs send -R "${child}@${COPY_SNAP}" | zfs recv -u -F "$target"
-  done < <(zfs list -H -r -d 1 -o name "$TEMP_ROOT")
+    size=$(_ds_size "${child}@${COPY_SNAP}")
+    _con "  [${n}] Restoring ${child_name}  size: ${size}  -> ${target}"
+    _con "  Running: zfs send -v -R | zfs recv  -- please wait..."
+    zfs send -v -R "${child}@${COPY_SNAP}" 2>/dev/console | zfs recv -u -F "$target"
+    _ok "  [${n}] ${child_name} restored"
+  done
 }
 
 finalize_bootfs() {
-  local bootfs_target="${SOURCE_ROOT}/${ROOT_CHILD_EXPECTED}"
-  zfs list -H "$bootfs_target" >/dev/null 2>&1 || \
-    die "expected boot dataset missing after restore: $bootfs_target"
-  zpool set bootfs="$bootfs_target" "$POOL"
+  _step 5 6 "Finalize: set pool bootfs"
+  _con "Checking: ${SOURCE_ROOT}/${ROOT_CHILD_EXPECTED}"
+  zfs list -H "${SOURCE_ROOT}/${ROOT_CHILD_EXPECTED}" >/dev/null 2>&1 || \
+    die "expected boot dataset missing after restore: ${SOURCE_ROOT}/${ROOT_CHILD_EXPECTED}"
+  _ok "Boot dataset present"
+  _con "Setting: zpool set bootfs=${SOURCE_ROOT}/${ROOT_CHILD_EXPECTED} ${POOL}"
+  zpool set bootfs="${SOURCE_ROOT}/${ROOT_CHILD_EXPECTED}" "$POOL"
+  _ok "bootfs -> ${SOURCE_ROOT}/${ROOT_CHILD_EXPECTED}"
 }
 
 cleanup_copy_if_requested() {
+  _step 6 6 "Cleanup temp dataset"
   if [ "$KEEP_COPY" -eq 1 ]; then
-    printf 'Keeping temporary dataset for rollback: %s\n' "$TEMP_ROOT"
+    _con "Keeping temp dataset for rollback: ${TEMP_ROOT}"
     return 0
   fi
-  printf 'Destroying temporary dataset: %s\n' "$TEMP_ROOT"
+  _con "Destroying: ${TEMP_ROOT}"
   zfs destroy -r "$TEMP_ROOT"
+  _ok "Temp dataset destroyed"
 }
 
 print_summary() {
-  printf '\nROOT encryption apply completed.\n'
-  printf 'Source snapshot used: %s@%s\n' "$SOURCE_ROOT" "$SNAPSHOT_NAME"
-  printf 'Pool bootfs:          %s/%s\n' "$SOURCE_ROOT" "$ROOT_CHILD_EXPECTED"
-  printf 'Passphrase file:      %s\n' "$PASS_FILE"
-  printf '\nRun after normal boot:\n'
-  printf '  zfs get encryption,encryptionroot,keystatus %s %s/%s\n' "$SOURCE_ROOT" "$SOURCE_ROOT" "$ROOT_CHILD_EXPECTED"
+  printf '\n============================================================\n'
+  printf '  ROOT ENCRYPTION APPLY COMPLETED SUCCESSFULLY\n'
+  printf '============================================================\n'
+  printf 'Snapshot used:   %s@%s\n' "$SOURCE_ROOT" "$SNAPSHOT_NAME"
+  printf 'Pool bootfs:     %s/%s\n' "$SOURCE_ROOT" "$ROOT_CHILD_EXPECTED"
+  printf 'Passphrase file: %s\n' "$PASS_FILE"
+  printf '\nPost-boot verification:\n'
+  printf '  zfs get encryption,encryptionroot,keystatus %s %s/%s\n' \
+    "$SOURCE_ROOT" "$SOURCE_ROOT" "$ROOT_CHILD_EXPECTED"
   printf '  zpool get bootfs %s\n' "$POOL"
   printf '  proxmox-boot-tool status\n'
+  printf '============================================================\n'
+  _con "APPLY COMPLETED SUCCESSFULLY - system will reboot"
 }
 
 print_recovery_summary() {
-  printf '\nROOT recovery completed.\n'
+  printf '\n============================================================\n'
+  printf '  ROOT RECOVERY COMPLETED SUCCESSFULLY\n'
+  printf '============================================================\n'
   printf 'Pool bootfs: %s/%s\n' "$SOURCE_ROOT" "$ROOT_CHILD_EXPECTED"
-  if [ -n "$SNAPSHOT_NAME" ]; then
-    printf 'Snapshot hint used: %s@%s\n' "$SOURCE_ROOT" "$SNAPSHOT_NAME"
-  fi
-  printf '\nRun after normal boot:\n'
-  printf '  zfs get encryption,encryptionroot,keystatus %s %s/%s\n' "$SOURCE_ROOT" "$SOURCE_ROOT" "$ROOT_CHILD_EXPECTED"
+  [ -n "$SNAPSHOT_NAME" ] && printf 'Snapshot:    %s@%s\n' "$SOURCE_ROOT" "$SNAPSHOT_NAME"
+  printf '\nPost-boot verification:\n'
+  printf '  zfs get encryption,encryptionroot,keystatus %s\n' "$SOURCE_ROOT"
   printf '  zpool get bootfs %s\n' "$POOL"
-  printf '  proxmox-boot-tool status\n'
+  printf '============================================================\n'
+  _con "RECOVERY COMPLETED - system will reboot"
 }
 
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --yes) AUTO_YES=1; shift ;;
@@ -292,14 +451,23 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+# ---------------------------------------------------------------------------
+# Main dispatch
+# ---------------------------------------------------------------------------
 if [ "$RECOVERY_MODE" -eq 1 ]; then
+  _con "=== pve-encrypt RECOVERY MODE ==="
+  diagnostic_checks
   need_cmd awk
   need_cmd modprobe
   need_cmd zfs
   need_cmd zpool
   [ "$(id -u)" -eq 0 ] || die "run as root"
   if [ -n "$PASS_FILE" ]; then
-    validate_passfile_layout "$(realpath "$PASS_FILE" 2>/dev/null || printf '%s' "$PASS_FILE")"
+    if command -v realpath >/dev/null 2>&1; then
+      validate_passfile_layout "$(realpath "$PASS_FILE" 2>/dev/null || printf '%s' "$PASS_FILE")"
+    else
+      validate_passfile_layout "$PASS_FILE"
+    fi
   fi
   confirm_or_abort "Restore ${SOURCE_ROOT} from temporary copy or snapshot?"
   restore_root_from_copy_or_snapshot
@@ -309,6 +477,8 @@ fi
 
 [ -n "$PASS_FILE" ] || usage
 
+_con "=== pve-encrypt APPLY MODE ==="
+diagnostic_checks
 validate_preflight
 confirm_or_abort "Encrypt ${SOURCE_ROOT} from initramfs using snapshot ${SOURCE_ROOT}@${SNAPSHOT_NAME}?"
 clone_unencrypted_root
