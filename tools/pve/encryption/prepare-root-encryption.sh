@@ -16,6 +16,7 @@ AUTO_YES=0
 SKIP_SNAPSHOT=0
 RESTORE_MODE=0
 RESTORE_PLAN_DIR=""
+UNDO_ENCRYPTION_MODE=0
 KEY_MOUNT_POINT=""
 UNLOCK_METHOD=""
 INSTALL_DROPBEAR=0
@@ -23,6 +24,7 @@ DROPBEAR_PORT=4748
 SOURCE_ROOT="rpool/ROOT"
 POOL="rpool"
 ROOT_CHILD="rpool/ROOT/pve-1"
+TEMP_ROOT="rpool/root-unencrypted-copy"
 SNAP_PREFIX="pre-root-encrypt"
 TS="$(date +%Y%m%d-%H%M%S)"
 WORKDIR="/root/root-encrypt-plan-${TS}"
@@ -34,6 +36,7 @@ INITRAMFS_MODULES_FILE="/etc/initramfs-tools/modules"
 DROPBEAR_CONF="/etc/dropbear/initramfs/dropbear.conf"
 DROPBEAR_AUTH_KEYS="/etc/dropbear/initramfs/authorized_keys"
 USB_UNLOCK_HOOK="/etc/initramfs-tools/scripts/local-top/zfs-root-usb-key-unlock"
+ZFS_INITRAMFS_LOAD_KEY_HELPER="/etc/zfs/initramfs-tools-load-key"
 GRUB_CUSTOM_FILE="/etc/grub.d/40_custom"
 BACKUP_DIR="${WORKDIR}/file-backups"
 CHECKLIST_FILE="${WORKDIR}/CHECKLIST.txt"
@@ -54,6 +57,7 @@ USB_PARTUUID=""
 BACKUP_KERNEL_PATH=""
 BACKUP_INITRD_PATH=""
 BOOT_ENTRY_STATUS="not-configured"
+FALLBACK_COPY_ENTRY_STATUS="not-configured"
 USB_FS_TYPE=""
 BOOT_LAYOUT="unknown"
 BOOT_REFRESH_ACTION="none"
@@ -77,11 +81,13 @@ usage() {
 Usage:
   prepare-root-encryption.sh <PASS_FILE> [--yes] [--skip-snapshot] [--unlock-method <usb|dropbear|both>] [--install-dropbear]
   prepare-root-encryption.sh --restore [PLAN_DIR] [--yes]
+  prepare-root-encryption.sh --undo-encryption [--yes]
 
 Options:
   --yes                 non-interactive confirmation
   --skip-snapshot       do not create a new rpool/ROOT recursive snapshot
   --restore [PLAN_DIR]  restore modified files from latest or selected root-encrypt-plan-* directory
+  --undo-encryption     schedule reversal of ZFS encryption on next reboot (requires backup copy or pre-encrypt snapshot)
   --unlock-method MODE  root unlock strategy in initramfs: usb, dropbear, both
   --install-dropbear    install missing dropbear-initramfs package automatically
 
@@ -269,8 +275,19 @@ remove_created_paths_from_plan() {
 restore_from_plan() {
   local plan_dir="$1"
   local restore_backup_dir="${plan_dir}/file-backups"
+  local enc=""
 
   [ -d "$restore_backup_dir" ] || die "backup directory not found in plan: ${restore_backup_dir}"
+
+  # Safety: if rpool/ROOT is already encrypted the conversion succeeded and the
+  # system is running on the encrypted pool.  Restoring the old initramfs/kernel
+  # files would make the next boot use an initramfs that tries to mount an
+  # unencrypted root that no longer exists, which bricks the system.
+  # Direct the user to --undo-encryption instead.
+  enc="$(zfs get -H -o value encryption "${SOURCE_ROOT}" 2>/dev/null || printf 'unknown')"
+  if [ "$enc" != "off" ] && [ "$enc" != "unknown" ]; then
+    die "${SOURCE_ROOT} is already encrypted (encryption=${enc}). The conversion completed successfully. Restoring old initramfs/kernel files would brick the system. Use --undo-encryption to reverse the ZFS encryption instead."
+  fi
 
   confirm_or_abort "Restore files from ${plan_dir}? This will overwrite current files with saved originals"
 
@@ -521,6 +538,97 @@ EOF
   chmod 0755 "$GRUB_CUSTOM_FILE"
 }
 
+create_unencrypted_copy_boot_entry() {
+  local fallback_cmdline=""
+  local temp_root_child=""
+  local fallback_entry_id=""
+  local tmp_custom=""
+  local begin_marker="# >>> pve-root-encrypt-copy-fallback >>>"
+  local end_marker="# <<< pve-root-encrypt-copy-fallback <<<"
+  local kernel_ver=""
+  local esp_root=""
+
+  # Reuse the backup kernel/initrd already copied by create_backup_boot_entry
+  [ -f "${BACKUP_KERNEL_PATH:-}" ] || return 0
+  [ -f "${BACKUP_INITRD_PATH:-}" ] || return 0
+
+  kernel_ver="$(uname -r)"
+  # The clone preserves child names: rpool/ROOT/pve-1 -> TEMP_ROOT/pve-1
+  temp_root_child="${TEMP_ROOT}/${ROOT_CHILD##*/}"
+  fallback_cmdline="root=ZFS=${temp_root_child} boot=zfs"
+  fallback_entry_id="proxmox-root-encrypt-copy-${TS}"
+
+  # Remove any previous fallback entry from the GRUB custom file
+  if [ -f "$GRUB_CUSTOM_FILE" ]; then
+    tmp_custom="$(mktemp)"
+    awk -v b="$begin_marker" -v e="$end_marker" '
+      $0 == b {skip=1; next}
+      $0 == e {skip=0; next}
+      !skip {print}
+    ' "$GRUB_CUSTOM_FILE" >"$tmp_custom"
+    mv -f "$tmp_custom" "$GRUB_CUSTOM_FILE"
+    chmod 0755 "$GRUB_CUSTOM_FILE"
+  fi
+
+  case "$BOOT_LAYOUT" in
+    proxmox-boot-tool-grub)
+      cat <<EOF >>"$GRUB_CUSTOM_FILE"
+
+${begin_marker}
+menuentry 'Proxmox unencrypted copy fallback (${TS})' {
+  insmod part_gpt
+  insmod fat
+  search --no-floppy --fs-uuid --set=root ${ESP_UUIDS[0]}
+  linux ${ESP_BACKUP_KERNEL_REL} ${fallback_cmdline}
+  initrd ${ESP_BACKUP_INITRD_REL}
+}
+${end_marker}
+EOF
+      chmod 0755 "$GRUB_CUSTOM_FILE"
+      FALLBACK_COPY_ENTRY_STATUS="configured-proxmox-grub-esp"
+      ;;
+    proxmox-boot-tool-systemd-boot)
+      write_systemd_boot_entries_to_esps "$fallback_entry_id" "Proxmox unencrypted copy fallback (${TS})" "$kernel_ver" "$fallback_cmdline" "$ESP_BACKUP_KERNEL_REL" "$ESP_BACKUP_INITRD_REL"
+      FALLBACK_COPY_ENTRY_STATUS="configured-proxmox-systemd-boot-esp"
+      ;;
+    systemd-boot)
+      if [ -d /boot/efi/loader/entries ]; then
+        esp_root="/boot/efi"
+      elif [ -d /efi/loader/entries ]; then
+        esp_root="/efi"
+      else
+        FALLBACK_COPY_ENTRY_STATUS="skipped-no-esp"
+        return 0
+      fi
+      # Reuse kernel/initrd already placed by write_local_systemd_boot_entry
+      cat <<EOF >"${esp_root}/loader/entries/${fallback_entry_id}.conf"
+title   Proxmox unencrypted copy fallback (${TS})
+version ${kernel_ver}
+options ${fallback_cmdline}
+linux   /EFI/proxmox/root-encrypt-backup-${TS}/vmlinuz-${kernel_ver}
+initrd  /EFI/proxmox/root-encrypt-backup-${TS}/initrd.img-${kernel_ver}
+EOF
+      FALLBACK_COPY_ENTRY_STATUS="configured-local-systemd-boot"
+      ;;
+    grub|grub-bios|unknown)
+      cat <<EOF >>"$GRUB_CUSTOM_FILE"
+
+${begin_marker}
+menuentry 'Proxmox unencrypted copy fallback (${TS})' {
+  linux ${BACKUP_KERNEL_PATH} ${fallback_cmdline}
+  initrd ${BACKUP_INITRD_PATH}
+}
+${end_marker}
+EOF
+      chmod 0755 "$GRUB_CUSTOM_FILE"
+      FALLBACK_COPY_ENTRY_STATUS="configured-40_custom"
+      ;;
+    *)
+      FALLBACK_COPY_ENTRY_STATUS="skipped-unknown-layout"
+      ;;
+  esac
+}
+
 detect_boot_layout() {
   local pbt_status=""
 
@@ -670,6 +778,7 @@ Unlock method: ${UNLOCK_METHOD}
 [x] Initramfs rebuilt: update-initramfs -u -k all
 [x] Boot config refresh: ${BOOT_REFRESH_ACTION}
 [x] Backup initrd entry: ${BOOT_ENTRY_STATUS}
+[x] Unencrypted copy fallback entry: ${FALLBACK_COPY_ENTRY_STATUS}
 
 USB details:
 - Source device: ${USB_SOURCE_DEVICE:-<not-set>}
@@ -721,6 +830,7 @@ configure_usb_prereqs() {
       ;;
   esac
 
+  write_zfs_initramfs_load_key_helper
   write_usb_unlock_hook
 }
 
@@ -746,6 +856,7 @@ configure_dropbear_prereqs() {
 
 rebuild_initramfs_and_refresh_boot() {
   create_backup_boot_entry
+  create_unencrypted_copy_boot_entry
   update-initramfs -u -k all
 
   case "$BOOT_LAYOUT" in
@@ -961,6 +1072,7 @@ print_summary() {
   printf 'Backup kernel: %s\n' "${BACKUP_KERNEL_PATH:-<not-set>}"
   printf 'Backup initrd: %s\n' "${BACKUP_INITRD_PATH:-<not-set>}"
   printf 'Boot entry:    %s\n' "$BOOT_ENTRY_STATUS"
+  printf 'Fallback entry:%s\n' " ${FALLBACK_COPY_ENTRY_STATUS}"
   printf 'State file:    %s\n' "$STATE_FILE"
   if unlock_method_uses_dropbear; then
     printf 'Dropbear conf: %s\n' "$DROPBEAR_CONF"
@@ -1013,25 +1125,140 @@ PASS_FILE="${pass_file}"
 KEY_MOUNT_POINT="${key_mount_point}"
 KEY_LOCATOR_TYPE="${key_locator_type}"
 KEY_LOCATOR_VALUE="${key_locator_value}"
+MAX_WAIT=30
 
-KEY_DEVICE=""
+_log() { printf '[zfs-usb-unlock] %s\n' "\$*" >/dev/console 2>/dev/null || true; }
+
 case "\$KEY_LOCATOR_TYPE" in
-  uuid) KEY_DEVICE="/dev/disk/by-uuid/\$KEY_LOCATOR_VALUE" ;;
+  uuid) ;;
   *) exit 0 ;;
 esac
 
-[ -b "\$KEY_DEVICE" ] || exit 0
+# Wait up to MAX_WAIT seconds for the USB device to appear.
+KEY_DEVICE=""
+i=0
+while [ "\$i" -lt "\$MAX_WAIT" ]; do
+  if [ -b "/dev/disk/by-uuid/\$KEY_LOCATOR_VALUE" ]; then
+    KEY_DEVICE="/dev/disk/by-uuid/\$KEY_LOCATOR_VALUE"
+    break
+  fi
+  if [ "\$i" -eq 0 ]; then
+    _log "Waiting for USB key device (UUID=\$KEY_LOCATOR_VALUE)..."
+  fi
+  sleep 1
+  i=\$((i + 1))
+done
+
+if [ -z "\$KEY_DEVICE" ]; then
+  _log "USB key device not found after \${MAX_WAIT}s (UUID=\$KEY_LOCATOR_VALUE)"
+  exit 0
+fi
+
 mkdir -p "\$KEY_MOUNT_POINT"
-mount -o ro "\$KEY_DEVICE" "\$KEY_MOUNT_POINT" >/dev/null 2>&1 || exit 0
+if ! mount -o ro "\$KEY_DEVICE" "\$KEY_MOUNT_POINT" >/dev/null 2>&1; then
+  _log "Failed to mount USB key device \$KEY_DEVICE on \$KEY_MOUNT_POINT"
+  exit 0
+fi
 
 if [ -f "\$PASS_FILE" ]; then
-  zfs load-key -L "file://\$PASS_FILE" "\$ROOT_DATASET" >/dev/null 2>&1 || true
+  _log "USB key file detected at \$PASS_FILE"
+else
+  _log "Key file not found on USB: \$PASS_FILE"
 fi
 
 umount "\$KEY_MOUNT_POINT" >/dev/null 2>&1 || true
 exit 0
 EOF
   chmod 0755 "$USB_UNLOCK_HOOK"
+}
+
+write_zfs_initramfs_load_key_helper() {
+  local root_dataset="$SOURCE_ROOT"
+  local pass_file="$PASS_FILE"
+  local key_mount_point="$KEY_MOUNT_POINT"
+  local key_locator_type="$USB_LOCATOR_TYPE"
+  local key_locator_value="$USB_LOCATOR_VALUE"
+  local usb_fs_type="$USB_FS_TYPE"
+
+  if ! unlock_method_uses_usb; then
+    return 0
+  fi
+
+  [ -n "$key_locator_value" ] || die "missing UUID locator for ZFS initramfs key helper"
+  backup_file "$ZFS_INITRAMFS_LOAD_KEY_HELPER"
+
+  mkdir -p "$(dirname "$ZFS_INITRAMFS_LOAD_KEY_HELPER")"
+  cat <<EOF >"$ZFS_INITRAMFS_LOAD_KEY_HELPER"
+#!/bin/sh
+
+ROOT_DATASET="${root_dataset}"
+PASS_FILE="${pass_file}"
+KEY_MOUNT_POINT="${key_mount_point}"
+KEY_LOCATOR_TYPE="${key_locator_type}"
+KEY_LOCATOR_VALUE="${key_locator_value}"
+KEY_FS_TYPE="${usb_fs_type}"
+MAX_WAIT=30
+
+_log() { printf '[zfs-initramfs-load-key] %s\n' "\$*" >/dev/console 2>/dev/null || true; }
+
+# ZFS native initramfs calls this helper after pool import.
+if [ -n "\${ENCRYPTIONROOT:-}" ] && [ "\$ENCRYPTIONROOT" != "\$ROOT_DATASET" ]; then
+  exit 0
+fi
+
+if zfs get -H -o value keystatus "\$ROOT_DATASET" 2>/dev/null | grep -q '^available$'; then
+  exit 0
+fi
+
+case "\$KEY_LOCATOR_TYPE" in
+  uuid) ;;
+  *) exit 0 ;;
+esac
+
+for module in usb-storage uas sd_mod scsi_mod; do
+  modprobe "\$module" >/dev/null 2>&1 || true
+done
+[ -n "\$KEY_FS_TYPE" ] && modprobe "\$KEY_FS_TYPE" >/dev/null 2>&1 || true
+
+KEY_DEVICE=""
+i=0
+while [ "\$i" -lt "\$MAX_WAIT" ]; do
+  if [ -b "/dev/disk/by-uuid/\$KEY_LOCATOR_VALUE" ]; then
+    KEY_DEVICE="/dev/disk/by-uuid/\$KEY_LOCATOR_VALUE"
+    break
+  fi
+  if [ "\$i" -eq 0 ]; then
+    _log "Waiting for USB key device (UUID=\$KEY_LOCATOR_VALUE)..."
+  fi
+  sleep 1
+  i=\$((i + 1))
+done
+
+if [ -z "\$KEY_DEVICE" ]; then
+  _log "USB key device not found after \${MAX_WAIT}s (UUID=\$KEY_LOCATOR_VALUE)"
+  exit 0
+fi
+
+mkdir -p "\$KEY_MOUNT_POINT"
+if ! mount -o ro "\$KEY_DEVICE" "\$KEY_MOUNT_POINT" >/dev/null 2>&1; then
+  _log "Failed to mount USB key device \$KEY_DEVICE on \$KEY_MOUNT_POINT"
+  exit 0
+fi
+
+if [ -f "\$PASS_FILE" ]; then
+  if zfs load-key -L "file://\$PASS_FILE" "\$ROOT_DATASET" >/dev/null 2>&1; then
+    _log "ZFS key loaded successfully for \$ROOT_DATASET"
+  else
+    _log "zfs load-key failed for \$ROOT_DATASET (wrong passphrase or dataset error)"
+  fi
+else
+  _log "Key file not found on USB: \$PASS_FILE"
+fi
+
+umount "\$KEY_MOUNT_POINT" >/dev/null 2>&1 || true
+exit 0
+EOF
+  chmod 0755 "$ZFS_INITRAMFS_LOAD_KEY_HELPER"
 }
 
 resolve_apply_script_source() {
@@ -1430,6 +1657,7 @@ mount_state_esp_rw || exit 0
 load_state || { umount_state_esp; exit 0; }
 restore_tmp_log_from_esp_if_needed
 
+APPLY_EXTRA_ARGS=""
 case "\$STATE" in
   completed|recovered) umount_state_esp; exit 0 ;;
   running)
@@ -1441,6 +1669,9 @@ case "\$STATE" in
     flush_log
     open_recovery_menu
     ;;
+  undo-encryption)
+    APPLY_EXTRA_ARGS="--undo-encryption"
+    ;;
   pending) ;;
   *) umount_state_esp; exit 0 ;;
 esac
@@ -1451,7 +1682,7 @@ if [ ! -x "\$APPLY_SCRIPT" ]; then
   open_recovery_menu
 fi
 
-if ! ensure_passfile_available; then
+if [ -z "\$APPLY_EXTRA_ARGS" ] && ! ensure_passfile_available; then
   write_state "failed" "pass_file_missing"
   flush_log
   open_recovery_menu
@@ -1466,9 +1697,13 @@ rm -f "\$TMP_LOG"
 # Run apply with tee so output is visible on screen AND logged.
 # Exit code is written to a temp file because a POSIX sh pipeline
 # returns the exit of the last process (tee), not the apply script.
-{ "\$APPLY_SCRIPT" "\$PASS_FILE" --snapshot "\$SNAPSHOT" --yes; printf '%d' "\$?" >"\$_apply_rc_file"; } 2>&1 | tee -a "\$TMP_LOG"
+{ "\$APPLY_SCRIPT" "\$PASS_FILE" --snapshot "\$SNAPSHOT" \${APPLY_EXTRA_ARGS} --yes; printf '%d' "\$?" >"\$_apply_rc_file"; } 2>&1 | tee -a "\$TMP_LOG"
 if [ "\$(cat "\$_apply_rc_file" 2>/dev/null)" = "0" ]; then
-  write_state "completed" ""
+  if [ -n "\$APPLY_EXTRA_ARGS" ]; then
+    write_state "recovered" ""
+  else
+    write_state "completed" ""
+  fi
   flush_log
   umount_state_esp
   msg "Apply succeeded. Rebooting..."
@@ -1484,6 +1719,132 @@ umount_state_esp
 exit 0
 EOF
   chmod 0755 "$INITRAMFS_AUTO_APPLY_HOOK"
+}
+
+# ---------------------------------------------------------------------------
+# Undo-encryption helpers
+# ---------------------------------------------------------------------------
+
+# Overwrite the state= field in all ESP state files to "undo-encryption",
+# preserving all other fields from the original prepare run.
+write_undo_encryption_state() {
+  local uuid="" mount_dir="" state_file_path="" current_state="" tmp=""
+
+  detect_boot_layout
+  build_state_esp_uuid_csv
+
+  case "$BOOT_LAYOUT" in
+    proxmox-boot-tool-grub|proxmox-boot-tool-systemd-boot)
+      [ "${#ESP_UUIDS[@]}" -gt 0 ] || die "cannot write undo state: no ESP UUIDs found"
+      for uuid in "${ESP_UUIDS[@]}"; do
+        mount_dir="/mnt/pve-root-encrypt-state-${uuid}"
+        mount_esp_rw_by_uuid "$uuid" "$mount_dir"
+        state_file_path="${mount_dir}${ESP_STATE_FILE_REL}"
+        if [ ! -f "$state_file_path" ]; then
+          umount "$mount_dir"
+          die "ESP state file not found on UUID=${uuid}: ${state_file_path}. Run prepare first."
+        fi
+        current_state="$(awk -F= '/^state=/{print $2}' "$state_file_path" | tail -n1)"
+        case "$current_state" in
+          completed|recovered|failed) ;;
+          *) umount "$mount_dir"; die "unexpected state '${current_state}' in ESP state file. Expected completed/recovered/failed." ;;
+        esac
+        tmp="$(mktemp)"
+        sed 's/^state=.*/state=undo-encryption/' "$state_file_path" >"$tmp"
+        mv -f "$tmp" "$state_file_path"
+        umount "$mount_dir"
+        printf 'Wrote undo-encryption state to ESP UUID=%s\n' "$uuid"
+      done
+      ;;
+    grub|grub-bios|systemd-boot|unknown)
+      local mnt=""
+      if mountpoint -q /boot/efi; then
+        mnt="/boot/efi"
+      elif mountpoint -q /efi; then
+        mnt="/efi"
+      else
+        die "cannot locate mounted ESP for state file write"
+      fi
+      state_file_path="${mnt}${ESP_STATE_FILE_REL}"
+      [ -f "$state_file_path" ] || die "ESP state file not found: ${state_file_path}. Run prepare first."
+      current_state="$(awk -F= '/^state=/{print $2}' "$state_file_path" | tail -n1)"
+      case "$current_state" in
+        completed|recovered|failed) ;;
+        *) die "unexpected state '${current_state}' in ESP state file. Expected completed/recovered/failed." ;;
+      esac
+      tmp="$(mktemp)"
+      sed 's/^state=.*/state=undo-encryption/' "$state_file_path" >"$tmp"
+      mv -f "$tmp" "$state_file_path"
+      printf 'Wrote undo-encryption state to ESP (%s)\n' "$mnt"
+      ;;
+  esac
+}
+
+run_undo_encryption_prepare() {
+  need_cmd sed
+  need_cmd update-initramfs
+  need_cmd zfs
+  need_cmd zpool
+  [ "$(id -u)" -eq 0 ] || die "run as root"
+
+  # Validate: SOURCE_ROOT must be encrypted
+  zfs list -H "$SOURCE_ROOT" >/dev/null 2>&1 || die "dataset not found: ${SOURCE_ROOT}"
+  enc="$(zfs get -H -o value encryption "$SOURCE_ROOT" 2>/dev/null || printf 'unknown')"
+  [ "$enc" != "off" ] && [ "$enc" != "unknown" ] || \
+    die "${SOURCE_ROOT} is not encrypted (encryption=${enc:-off}) - nothing to undo"
+  printf 'rpool/ROOT encryption: %s - confirmed\n' "$enc"
+
+  # Validate: undo source must exist
+  if zfs list -H "$TEMP_ROOT" >/dev/null 2>&1; then
+    printf 'Backup copy found: %s\n' "$TEMP_ROOT"
+  else
+    printf 'Backup copy %s not found - checking for pre-encrypt snapshot...\n' "$TEMP_ROOT"
+    snap_name="$(zfs list -H -t snapshot -o name -s creation 2>/dev/null | \
+      awk -v d="${SOURCE_ROOT}@" '$1 ~ "^" d "pre-root-encrypt-" {name=$1} END {sub(/^.*@/, "", name); print name}')"
+    [ -n "$snap_name" ] || \
+      die "no undo source found: ${TEMP_ROOT} absent and no pre-root-encrypt-* snapshot exists"
+    printf 'Pre-encrypt snapshot found: %s@%s\n' "$SOURCE_ROOT" "$snap_name"
+  fi
+
+  # Validate: initramfs apply hook must be in place
+  [ -f "$INITRAMFS_AUTO_APPLY_HOOK" ] || \
+    die "initramfs apply hook not found: ${INITRAMFS_AUTO_APPLY_HOOK}. Re-run prepare to reinstall hooks first."
+  printf 'Initramfs apply hook: %s - found\n' "$INITRAMFS_AUTO_APPLY_HOOK"
+
+  confirm_or_abort "Schedule undo-encryption on next reboot? Will destroy encrypted ${SOURCE_ROOT} and restore from backup."
+
+  # Update the embedded apply script and rebuild initramfs so the
+  # --undo-encryption flag is supported by the initramfs-embedded copy.
+  apply_source="$(resolve_apply_script_source)"
+  [ -f "$apply_source" ] || die "apply script not found: ${apply_source}"
+  mkdir -p "$AUTOMATION_DIR"
+  cp -a "$apply_source" "$AUTOMATION_APPLY_FILE"
+  chmod 0755 "$AUTOMATION_APPLY_FILE"
+  printf 'Updated apply script: %s\n' "$AUTOMATION_APPLY_FILE"
+
+  printf 'Rebuilding initramfs to embed updated apply script...\n'
+  update-initramfs -u -k all
+
+  detect_boot_layout
+  case "$BOOT_LAYOUT" in
+    proxmox-boot-tool-grub|proxmox-boot-tool-systemd-boot)
+      proxmox-boot-tool refresh
+      ;;
+    grub|grub-bios|unknown)
+      update-grub 2>/dev/null || true
+      ;;
+  esac
+
+  write_undo_encryption_state
+
+  printf '\nUndo-encryption scheduled.\n'
+  printf 'NEXT STEP: Reboot the system.\n'
+  printf 'On next boot the initramfs hook will:\n'
+  printf '  1. Detect state=undo-encryption\n'
+  printf '  2. Destroy the encrypted %s\n' "$SOURCE_ROOT"
+  printf '  3. Restore from the unencrypted backup copy/snapshot\n'
+  printf '  4. Set bootfs and reboot\n'
+  printf 'The system will then boot normally without encryption.\n'
 }
 
 install_initramfs_automation_assets() {
@@ -1514,6 +1875,10 @@ while [ "$#" -gt 0 ]; do
         shift
       fi
       ;;
+    --undo-encryption)
+      UNDO_ENCRYPTION_MODE=1
+      shift
+      ;;
     --unlock-method)
       [ "$#" -ge 2 ] || die "--unlock-method requires a value"
       UNLOCK_METHOD="$2"
@@ -1541,6 +1906,12 @@ if [ "$RESTORE_MODE" -eq 1 ]; then
   validate_restore_environment
   resolve_restore_plan_dir
   restore_from_plan "$RESTORE_PLAN_DIR"
+  exit 0
+fi
+
+if [ "$UNDO_ENCRYPTION_MODE" -eq 1 ]; then
+  [ -n "$PASS_FILE" ] && die "PASS_FILE must not be provided with --undo-encryption"
+  run_undo_encryption_prepare
   exit 0
 fi
 

@@ -16,6 +16,7 @@ AUTO_YES=0
 KEEP_COPY=0
 SNAPSHOT_NAME=""
 RECOVERY_MODE=0
+UNDO_MODE=0
 
 POOL="rpool"
 SOURCE_ROOT="rpool/ROOT"
@@ -76,7 +77,7 @@ Usage:
 Options:
   --snapshot NAME      source snapshot name on rpool/ROOT (without dataset prefix)
   --yes                non-interactive confirmation
-  --keep-copy          keep temp dataset rpool/root-unencrypted-copy for manual rollback
+  --keep-copy          deprecated (backup copy is now always kept)
   --recover-root       restore unencrypted rpool/ROOT from temporary copy or snapshot
 EOF
   exit 1
@@ -325,6 +326,16 @@ clone_unencrypted_root() {
   _con "Running: zfs send -v -R | zfs recv  -- this may take several minutes..."
   zfs send -v -R "${SOURCE_ROOT}@${SNAPSHOT_NAME}" 2>/dev/console | zfs recv -u -F "$TEMP_ROOT"
   _ok "Clone completed: ${TEMP_ROOT} (used: $(zfs get -H -o value used "$TEMP_ROOT" 2>/dev/null || echo '?'))"
+
+  # Set canmount=noauto on backup child datasets whose mountpoint is '/'.
+  # If left as canmount=on, zfs-mount.service will try to mount the backup at '/'
+  # when booting from the encrypted root, causing a mount conflict and boot hang.
+  zfs list -H -r -o name,mountpoint "$TEMP_ROOT" 2>/dev/null | while IFS="	" read -r ds mp; do
+    if [ "$mp" = "/" ]; then
+      zfs set canmount=noauto "$ds" 2>/dev/null || true
+      _ok "Set canmount=noauto on backup child: ${ds} (prevents boot mount conflict)"
+    fi
+  done
 }
 
 create_encrypted_root() {
@@ -334,25 +345,34 @@ create_encrypted_root() {
   _ok "${SOURCE_ROOT} destroyed"
 
   _step 3 6 "Create encrypted ${SOURCE_ROOT}"
-  _con "Encryption: aes-256-gcm  keyformat: passphrase"
-  _con "The next two prompts come from ZFS and set the new passphrase for ${SOURCE_ROOT}."
-  _con "IMPORTANT: enter exactly the same passphrase stored in ${PASS_FILE}."
+  _con "Encryption: aes-256-gcm  keyformat: passphrase  keylocation: file://${PASS_FILE}"
+  _con "Using passphrase file from USB directly (no interactive prompt)."
   zfs create \
     -o encryption=aes-256-gcm \
     -o keyformat=passphrase \
-    -o keylocation="prompt" \
+    -o keylocation="file://${PASS_FILE}" \
     -o mountpoint="/rpool/ROOT" \
     -o canmount=off \
     "$SOURCE_ROOT"
   _ok "${SOURCE_ROOT} created (encrypted)"
 
-  _con "Validating the entered passphrase against: ${PASS_FILE}"
+  _con "Validating encryption key using: ${PASS_FILE}"
   zfs unload-key "$SOURCE_ROOT" >/dev/null 2>&1 || die "unable to unload encryption key for validation"
   if zfs load-key -L "file://${PASS_FILE}" "$SOURCE_ROOT"; then
     _ok "Encryption key validated and loaded from PASS_FILE"
   else
-    die "passphrase entered at ZFS prompt does not match ${PASS_FILE}"
+    die "unable to load encryption key from ${PASS_FILE}"
   fi
+}
+
+# Change keylocation to 'prompt' after validation so that:
+# - The USB unlock hook uses explicit -L file://... to load the key at boot
+# - If the hook fails, ZFS falls back to an interactive passphrase prompt
+#   instead of a cryptic "file not found" error.
+set_keylocation_prompt() {
+  _con "Setting keylocation=prompt on ${SOURCE_ROOT} (USB hook will use -L override at boot)"
+  zfs set keylocation=prompt "$SOURCE_ROOT"
+  _ok "keylocation=prompt set on ${SOURCE_ROOT}"
 }
 
 restore_children_into_encrypted_root() {
@@ -390,40 +410,149 @@ finalize_bootfs() {
 
 cleanup_copy_if_requested() {
   _step 6 6 "Cleanup temp dataset"
-  if [ "$KEEP_COPY" -eq 1 ]; then
-    _con "Keeping temp dataset for rollback: ${TEMP_ROOT}"
-    return 0
-  fi
-  _con "Destroying: ${TEMP_ROOT}"
-  zfs destroy -r "$TEMP_ROOT"
-  _ok "Temp dataset destroyed"
+  _con "Keeping backup dataset for rollback: ${TEMP_ROOT}"
+  _con "To remove it manually after validation, run: zfs destroy -r ${TEMP_ROOT}"
+  _ok "Backup dataset retained"
 }
 
-wait_for_completion_confirmation() {
-  local mode="$1" answer=""
+# wait_for_console_confirmation TITLE HINT
+# Always reads from /dev/console regardless of AUTO_YES - user must confirm.
+wait_for_console_confirmation() {
+  local title="$1" hint="$2" answer=""
 
+  printf '\n============================================================\n' >/dev/console
+  printf '  %s\n' "$title" >/dev/console
+  printf '============================================================\n' >/dev/console
+  printf '%s\n' "$hint" >/dev/console
   while :; do
-    printf '\n============================================================\n'
-    printf '  CONFIRM NEXT ACTION\n'
-    printf '============================================================\n'
-    printf 'Press Enter to continue. If launched by the initramfs auto-apply hook,\n'
-    printf 'the system will reboot immediately after this confirmation.\n'
-    printf 'Type shell to open an emergency shell.\n'
-    printf 'Confirmation (%s): ' "$mode" >/dev/console
+    printf 'Press Enter to confirm, or type "shell" for emergency shell: ' >/dev/console
     read -r answer </dev/console
     case "$answer" in
       "")
-        _ok "Confirmation received"
+        _ok "Confirmed: ${title}"
         return 0
         ;;
       shell)
         /bin/sh </dev/console >/dev/console 2>&1
+        printf '\n[Back from shell - %s]\n' "$title" >/dev/console
         ;;
       *)
-        _con "Invalid input. Press Enter to continue or type shell."
+        printf 'Invalid input - press Enter or type "shell".\n' >/dev/console
         ;;
     esac
   done
+}
+
+# ---------------------------------------------------------------------------
+# Undo encryption: destroy encrypted SOURCE_ROOT, restore from backup copy
+# ---------------------------------------------------------------------------
+run_undo_encryption() {
+  local enc="" restore_src="" undo_snap="undo-${TS}"
+  local clone_target="${POOL}/root-undo-restore"
+  local child="" child_name="" target="" size="" n=0
+
+  _con "=== pve-encrypt UNDO ENCRYPTION MODE ==="
+  diagnostic_checks
+
+  _step 0 5 "Pre-checks"
+  need_cmd awk
+  need_cmd modprobe
+  need_cmd zfs
+  need_cmd zpool
+  [ "$(id -u)" -eq 0 ] || die "run as root"
+
+  import_pool_if_needed
+
+  zfs list -H "$SOURCE_ROOT" >/dev/null 2>&1 || die "dataset not found: ${SOURCE_ROOT}"
+  enc="$(zfs get -H -o value encryption "$SOURCE_ROOT")"
+  [ "$enc" != "off" ] || die "${SOURCE_ROOT} is not encrypted (encryption=off) - nothing to undo"
+  _ok "${SOURCE_ROOT} is encrypted (${enc}) - will be reversed"
+
+  if zfs list -H "$TEMP_ROOT" >/dev/null 2>&1; then
+    size=$(_ds_size "$TEMP_ROOT")
+    _ok "Backup copy found: ${TEMP_ROOT} (used: ${size})"
+    restore_src="$TEMP_ROOT"
+  else
+    _con "Backup copy ${TEMP_ROOT} not found - checking pre-encrypt snapshot..."
+    detect_snapshot_if_missing
+    zfs list -H "${SOURCE_ROOT}@${SNAPSHOT_NAME}" >/dev/null 2>&1 || \
+      die "no undo source: ${TEMP_ROOT} absent and no pre-root-encrypt snapshot found"
+    size=$(_ds_size "${SOURCE_ROOT}@${SNAPSHOT_NAME}")
+    _ok "Pre-encrypt snapshot: ${SOURCE_ROOT}@${SNAPSHOT_NAME} (size: ${size})"
+    restore_src="snapshot"
+  fi
+  _ok "Pre-checks passed"
+
+  wait_for_console_confirmation "UNDO ENCRYPTION - CONFIRM" \
+    "Will DESTROY encrypted ${SOURCE_ROOT} and restore unencrypted backup. THIS IS IRREVERSIBLE."
+
+  if [ "$restore_src" = "snapshot" ]; then
+    size=$(_ds_size "${SOURCE_ROOT}@${SNAPSHOT_NAME}")
+    _step 1 5 "Clone pre-encrypt snapshot into restore copy (size: ${size})"
+    if zfs list -H "$clone_target" >/dev/null 2>&1; then
+      _con "Removing stale restore copy: ${clone_target}"
+      zfs destroy -r "$clone_target"
+    fi
+    _con "Running: zfs send -v -R | zfs recv -- please wait..."
+    zfs send -v -R "${SOURCE_ROOT}@${SNAPSHOT_NAME}" 2>/dev/console | zfs recv -u -F "$clone_target"
+    _ok "Restore copy created: ${clone_target}"
+    restore_src="$clone_target"
+  else
+    _step 1 5 "Snapshot restore source"
+  fi
+
+  _con "Creating snapshot: ${restore_src}@${undo_snap}"
+  zfs snapshot -r "${restore_src}@${undo_snap}"
+  _ok "Snapshot created: ${restore_src}@${undo_snap}"
+
+  _step 2 5 "Destroy encrypted ${SOURCE_ROOT}"
+  _con "NOTE: restore source ${restore_src} is the safety copy"
+  zfs destroy -r "$SOURCE_ROOT"
+  _ok "${SOURCE_ROOT} destroyed"
+
+  _step 3 5 "Recreate unencrypted ${SOURCE_ROOT}"
+  zfs create -o mountpoint="/rpool/ROOT" -o canmount=off "$SOURCE_ROOT"
+  _ok "${SOURCE_ROOT} created (unencrypted)"
+
+  _step 4 5 "Restore children into ${SOURCE_ROOT}"
+  zfs list -H -r -d 1 -o name "$restore_src" | while IFS= read -r child; do
+    [ -n "$child" ] || continue
+    [ "$child" = "$restore_src" ] && continue
+    n=$((n + 1))
+    child_name="${child##*/}"
+    target="${SOURCE_ROOT}/${child_name}"
+    size=$(_ds_size "${child}@${undo_snap}")
+    _con "  [${n}] Restoring ${child_name} (${size}) -> ${target}"
+    _con "  Running: zfs send -v -R | zfs recv -- please wait..."
+    zfs send -v -R "${child}@${undo_snap}" 2>/dev/console | zfs recv -u -F "$target"
+    _ok "  [${n}] ${child_name} restored"
+  done
+
+  _step 5 5 "Finalize"
+  zfs list -H "${SOURCE_ROOT}/${ROOT_CHILD_EXPECTED}" >/dev/null 2>&1 || \
+    die "expected boot dataset missing after restore: ${SOURCE_ROOT}/${ROOT_CHILD_EXPECTED}"
+  _con "Setting: zpool set bootfs=${SOURCE_ROOT}/${ROOT_CHILD_EXPECTED} ${POOL}"
+  zpool set bootfs="${SOURCE_ROOT}/${ROOT_CHILD_EXPECTED}" "$POOL"
+  _ok "bootfs -> ${SOURCE_ROOT}/${ROOT_CHILD_EXPECTED}"
+
+  if [ "$restore_src" = "$clone_target" ] && zfs list -H "$clone_target" >/dev/null 2>&1; then
+    _con "Cleaning up temporary restore copy: ${clone_target}"
+    zfs destroy -r "$clone_target" >/dev/null 2>&1 || true
+    _ok "Temporary restore copy removed"
+  fi
+
+  printf '\n============================================================\n'
+  printf '  UNDO ENCRYPTION COMPLETED SUCCESSFULLY\n'
+  printf '============================================================\n'
+  printf 'Pool bootfs: %s/%s\n' "$SOURCE_ROOT" "$ROOT_CHILD_EXPECTED"
+  printf 'Encryption reversed. %s is now unencrypted.\n' "$SOURCE_ROOT"
+  printf '\nPost-boot verification:\n'
+  printf '  zfs get encryption,encryptionroot,keystatus %s\n' "$SOURCE_ROOT"
+  printf '  zpool get bootfs %s\n' "$POOL"
+  printf '============================================================\n'
+  _con "UNDO ENCRYPTION COMPLETED SUCCESSFULLY"
+  wait_for_console_confirmation "UNDO COMPLETED" \
+    "Press Enter to allow the initramfs hook to reboot. The system will boot without encryption."
 }
 
 print_summary() {
@@ -433,6 +562,9 @@ print_summary() {
   printf 'Snapshot used:   %s@%s\n' "$SOURCE_ROOT" "$SNAPSHOT_NAME"
   printf 'Pool bootfs:     %s/%s\n' "$SOURCE_ROOT" "$ROOT_CHILD_EXPECTED"
   printf 'Passphrase file: %s\n' "$PASS_FILE"
+  printf 'Backup dataset:  %s (kept for rollback)\n' "$TEMP_ROOT"
+  printf '\nManual cleanup (when no longer needed):\n'
+  printf '  zfs destroy -r %s\n' "$TEMP_ROOT"
   printf '\nPost-boot verification:\n'
   printf '  zfs get encryption,encryptionroot,keystatus %s %s/%s\n' \
     "$SOURCE_ROOT" "$SOURCE_ROOT" "$ROOT_CHILD_EXPECTED"
@@ -440,7 +572,8 @@ print_summary() {
   printf '  proxmox-boot-tool status\n'
   printf '============================================================\n'
   _con "APPLY COMPLETED SUCCESSFULLY"
-  wait_for_completion_confirmation "apply"
+  wait_for_console_confirmation "APPLY COMPLETED" \
+    "Press Enter to allow the initramfs hook to reboot. Type 'shell' to inspect the system first."
 }
 
 print_recovery_summary() {
@@ -454,7 +587,8 @@ print_recovery_summary() {
   printf '  zpool get bootfs %s\n' "$POOL"
   printf '============================================================\n'
   _con "RECOVERY COMPLETED"
-  wait_for_completion_confirmation "recovery"
+  wait_for_console_confirmation "RECOVERY COMPLETED" \
+    "Press Enter to allow the initramfs hook to reboot. Type 'shell' to inspect the system first."
 }
 
 # ---------------------------------------------------------------------------
@@ -465,6 +599,7 @@ while [ "$#" -gt 0 ]; do
     --yes) AUTO_YES=1; shift ;;
     --keep-copy) KEEP_COPY=1; shift ;;
     --recover-root) RECOVERY_MODE=1; shift ;;
+    --undo-encryption) UNDO_MODE=1; shift ;;
     --snapshot)
       [ "$#" -ge 2 ] || die "--snapshot requires a value"
       SNAPSHOT_NAME="$2"
@@ -507,14 +642,21 @@ if [ "$RECOVERY_MODE" -eq 1 ]; then
   exit 0
 fi
 
-[ -n "$PASS_FILE" ] || usage
+[ -n "$PASS_FILE" ] || [ "$UNDO_MODE" -eq 1 ] || usage
+
+if [ "$UNDO_MODE" -eq 1 ]; then
+  run_undo_encryption
+  exit 0
+fi
 
 _con "=== pve-encrypt APPLY MODE ==="
 diagnostic_checks
 validate_preflight
-confirm_or_abort "Encrypt ${SOURCE_ROOT} from initramfs using snapshot ${SOURCE_ROOT}@${SNAPSHOT_NAME}?"
+wait_for_console_confirmation "PREFLIGHT PASSED - CONFIRM ENCRYPTION START" \
+  "All checks passed for ${SOURCE_ROOT}. Snapshot: ${SOURCE_ROOT}@${SNAPSHOT_NAME}. Press Enter to begin encryption."
 clone_unencrypted_root
 create_encrypted_root
+set_keylocation_prompt
 restore_children_into_encrypted_root
 finalize_bootfs
 cleanup_copy_if_requested
