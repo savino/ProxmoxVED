@@ -335,6 +335,8 @@ create_encrypted_root() {
 
   _step 3 6 "Create encrypted ${SOURCE_ROOT}"
   _con "Encryption: aes-256-gcm  keyformat: passphrase"
+  _con "The next two prompts come from ZFS and set the new passphrase for ${SOURCE_ROOT}."
+  _con "IMPORTANT: enter exactly the same passphrase stored in ${PASS_FILE}."
   zfs create \
     -o encryption=aes-256-gcm \
     -o keyformat=passphrase \
@@ -344,11 +346,12 @@ create_encrypted_root() {
     "$SOURCE_ROOT"
   _ok "${SOURCE_ROOT} created (encrypted)"
 
-  _con "Loading encryption key from: ${PASS_FILE}"
+  _con "Validating the entered passphrase against: ${PASS_FILE}"
+  zfs unload-key "$SOURCE_ROOT" >/dev/null 2>&1 || die "unable to unload encryption key for validation"
   if zfs load-key -L "file://${PASS_FILE}" "$SOURCE_ROOT"; then
-    _ok "Encryption key loaded"
+    _ok "Encryption key validated and loaded from PASS_FILE"
   else
-    _con "WARNING: zfs load-key returned non-zero (continuing)"
+    die "passphrase entered at ZFS prompt does not match ${PASS_FILE}"
   fi
 }
 
@@ -368,8 +371,8 @@ restore_children_into_encrypted_root() {
     target="${SOURCE_ROOT}/${child_name}"
     size=$(_ds_size "${child}@${COPY_SNAP}")
     _con "  [${n}] Restoring ${child_name}  size: ${size}  -> ${target}"
-    _con "  Running: zfs send -v -R | zfs recv  -- please wait..."
-    zfs send -v -R "${child}@${COPY_SNAP}" 2>/dev/console | zfs recv -u -F "$target"
+    _con "  Running: zfs send -v -R | zfs recv -x encryption  -- please wait..."
+    zfs send -v -R "${child}@${COPY_SNAP}" 2>/dev/console | zfs recv -u -F -x encryption "$target"
     _ok "  [${n}] ${child_name} restored"
   done
 }
@@ -396,6 +399,33 @@ cleanup_copy_if_requested() {
   _ok "Temp dataset destroyed"
 }
 
+wait_for_completion_confirmation() {
+  local mode="$1" answer=""
+
+  while :; do
+    printf '\n============================================================\n'
+    printf '  CONFIRM NEXT ACTION\n'
+    printf '============================================================\n'
+    printf 'Press Enter to continue. If launched by the initramfs auto-apply hook,\n'
+    printf 'the system will reboot immediately after this confirmation.\n'
+    printf 'Type shell to open an emergency shell.\n'
+    printf 'Confirmation (%s): ' "$mode" >/dev/console
+    read -r answer </dev/console
+    case "$answer" in
+      "")
+        _ok "Confirmation received"
+        return 0
+        ;;
+      shell)
+        /bin/sh </dev/console >/dev/console 2>&1
+        ;;
+      *)
+        _con "Invalid input. Press Enter to continue or type shell."
+        ;;
+    esac
+  done
+}
+
 print_summary() {
   printf '\n============================================================\n'
   printf '  ROOT ENCRYPTION APPLY COMPLETED SUCCESSFULLY\n'
@@ -409,7 +439,8 @@ print_summary() {
   printf '  zpool get bootfs %s\n' "$POOL"
   printf '  proxmox-boot-tool status\n'
   printf '============================================================\n'
-  _con "APPLY COMPLETED SUCCESSFULLY - system will reboot"
+  _con "APPLY COMPLETED SUCCESSFULLY"
+  wait_for_completion_confirmation "apply"
 }
 
 print_recovery_summary() {
@@ -422,7 +453,8 @@ print_recovery_summary() {
   printf '  zfs get encryption,encryptionroot,keystatus %s\n' "$SOURCE_ROOT"
   printf '  zpool get bootfs %s\n' "$POOL"
   printf '============================================================\n'
-  _con "RECOVERY COMPLETED - system will reboot"
+  _con "RECOVERY COMPLETED"
+  wait_for_completion_confirmation "recovery"
 }
 
 # ---------------------------------------------------------------------------
